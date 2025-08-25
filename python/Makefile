@@ -3,11 +3,16 @@
 IMAGE_NAME := root-io-python
 TAG := latest
 DOCKERFILE_PROVIDER := Dockerfile.provider
+DOCKERFILE_PROVIDER_MIN := Dockerfile.provider-min
 DOCKERFILE_OSP := Dockerfile.osp
 
 build-provider:
 	@echo "Building Docker image using $(DOCKERFILE_PROVIDER)..."
 	export DOCKER_BUILDKIT=1; docker build --secret id=wolfssl_password,src=password.txt -t $(IMAGE_NAME)-provider:$(TAG) -f $(DOCKERFILE_PROVIDER) .
+
+build-provider-min:
+	@echo "Building Docker image using $(DOCKERFILE_PROVIDER_MIN)..."
+	export DOCKER_BUILDKIT=1; docker build --secret id=wolfssl_password,src=password.txt -t $(IMAGE_NAME)-provider-min:$(TAG) -f $(DOCKERFILE_PROVIDER_MIN) .
 
 build-osp:
 	@echo "Building Docker image using $(DOCKERFILE_OSP)..."
@@ -16,6 +21,10 @@ build-osp:
 run-provider: build-provider
 	@echo "Running Docker container..."
 	docker run --rm -it $(IMAGE_NAME)-provider:$(TAG) sh
+
+run-provider-min: build-provider-min
+	@echo "Running Docker container..."
+	docker run --rm -it $(IMAGE_NAME)-provider-min:$(TAG) sh
 
 run-osp: build-osp
 	@echo "Running Docker container..."
