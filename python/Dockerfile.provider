@@ -27,6 +27,8 @@ ENV PYTHON_SHA256 c30bb24b7f1e9a19b11b55a546434f74e739bb4c271a3e3a80ff4380d49f7a
 ENV WOLFSSL_URL https://www.wolfssl.com/comm/wolfssl/wolfssl-5.8.2-commercial-fips-v5.2.3.7z
 ENV WOLFPROVIDER_URL https://github.com/wolfSSL/wolfProvider/archive/refs/tags/v1.0.2.tar.gz
 
+COPY test-fips.c /test-fips.c
+
 RUN --mount=type=secret,id=wolfssl_password \
 	set -eux; \
 	\
@@ -88,6 +90,9 @@ RUN --mount=type=secret,id=wolfssl_password \
 	cd /; \
 	rm -rf /usr/src/wolfssl; \
 	\
+	gcc /test-fips.c -o /test-fips -lwolfssl; \
+    rm /test-fips.c; \
+    \
 	# Download wolfProvider source code
 	wget -O wolfprovider.tar.gz ${WOLFPROVIDER_URL}; \
 	tar --extract --directory /usr/src --file wolfprovider.tar.gz; \

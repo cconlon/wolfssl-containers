@@ -26,6 +26,8 @@ ENV PYTHON_VERSION 3.12.6
 ENV PYTHON_SHA256 1999658298cf2fb837dffed8ff3c033ef0c98ef20cf73c5d5f66bed5ab89697c
 ENV WOLFSSL_URL https://www.wolfssl.com/comm/wolfssl/wolfssl-5.8.2-commercial-fips-v5.2.3.7z
 
+COPY test-fips.c /test-fips.c
+
 RUN --mount=type=secret,id=wolfssl_password \
 	set -eux; \
 	\
@@ -87,6 +89,9 @@ RUN --mount=type=secret,id=wolfssl_password \
 	cd /; \
 	rm -rf /usr/src/wolfssl; \
 	\
+    gcc /test-fips.c -o /test-fips -lwolfssl; \
+    rm /test-fips.c; \
+    \
 	wget -O python.tar.xz "https://www.python.org/ftp/python/${PYTHON_VERSION%%[a-z]*}/Python-$PYTHON_VERSION.tar.xz"; \
 	echo "$PYTHON_SHA256 *python.tar.xz" | sha256sum -c -; \
 	wget -O python.tar.xz.asc "https://www.python.org/ftp/python/${PYTHON_VERSION%%[a-z]*}/Python-$PYTHON_VERSION.tar.xz.asc"; \
