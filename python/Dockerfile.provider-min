@@ -1,0 +1,74 @@
+FROM python:3.12-alpine3.22
+
+ENV WOLFSSL_URL=https://www.wolfssl.com/comm/wolfssl/wolfssl-5.8.2-commercial-fips-v5.2.3.7z
+ENV WOLFPROVIDER_URL=https://github.com/wolfSSL/wolfProvider/archive/refs/tags/v1.0.2.tar.gz
+
+COPY test-fips.c /test-fips.c
+
+RUN --mount=type=secret,id=wolfssl_password \
+	set -eux; \
+	\
+	apk add --no-cache --virtual .build-deps \
+		7zip \
+		autoconf \
+		autoconf-archive \
+		automake \
+		gnupg \
+		\
+		gcc \
+		libc-dev \
+		libnsl-dev \
+		libtirpc-dev \
+		libtool \
+		linux-headers \
+		make \
+		openssl-dev \
+		util-linux-dev \
+	; \
+	# Download wolfSSL source code
+	mkdir -p /usr/src; \
+	wget -O wolfssl.7z "${WOLFSSL_URL}"; \
+    cat /run/secrets/wolfssl_password | 7z x wolfssl.7z -o/usr/src; \
+	rm wolfssl.7z; \
+    mv /usr/src/wolfssl* /usr/src/wolfssl; \
+	\
+	# Compile and install wolfSSL
+	cd /usr/src/wolfssl; \
+	./configure --enable-opensslcoexist --enable-cmac --enable-keygen --enable-sha \
+	    --enable-aesctr --enable-aesccm --enable-x963kdf --enable-compkey CPPFLAGS="-DHAVE_AES_ECB \
+					-DWOLFSSL_AES_DIRECT -DWC_RSA_NO_PADDING -DWOLFSSL_PUBLIC_MP -DHAVE_PUBLIC_FFDHE \
+					-DWOLFSSL_DH_EXTRA -DWOLFSSL_PSS_LONG_SALT -DWOLFSSL_PSS_SALT_LEN_DISCOVER -DRSA_MIN_SIZE=2048" \
+		--enable-certgen --enable-aeskeywrap --enable-enckeys --enable-base16 --with-eccminsz=192 --prefix=/usr \
+		--enable-fips=v5; \
+	make; \
+	./fips-hash.sh; \
+	make; \
+    make install; \
+	cd /; \
+	rm -rf /usr/src/wolfssl; \
+	\
+	# Download wolfProvider source code
+	wget -O wolfprovider.tar.gz ${WOLFPROVIDER_URL}; \
+	tar --extract --directory /usr/src --file wolfprovider.tar.gz; \
+	rm wolfprovider.tar.gz; \
+	ls /usr/src; \
+    mv /usr/src/wolfProvider* /usr/src/wolfProvider; \
+	# Compile and install wolfProvider
+	cd /usr/src/wolfProvider; \
+	autoreconf -ivf; \
+    ./configure --prefix=/usr; \
+	make; \
+	make install; \
+	cd /; \
+	rm -rf /usr/src/wolfProvider; \
+    \
+	gcc /test-fips.c -o /test-fips -lwolfssl; \
+    rm /test-fips.c; \
+    \
+    apk del --no-network .build-deps;
+
+COPY openssl.cnf /etc/ssl/openssl.cnf
+
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod 755 /docker-entrypoint.sh
+ENTRYPOINT ["/docker-entrypoint.sh"]
