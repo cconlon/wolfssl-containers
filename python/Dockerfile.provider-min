@@ -60,7 +60,7 @@ RUN --mount=type=secret,id=wolfssl_password \
 	make; \
 	make install; \
 	cd /; \
-	rm -rf /usr/src/wolfprov; \
+	rm -rf /usr/src/wolfProvider; \
     \
 	gcc /test-fips.c -o /test-fips -lwolfssl; \
     rm /test-fips.c; \

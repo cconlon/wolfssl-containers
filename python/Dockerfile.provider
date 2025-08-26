@@ -106,7 +106,7 @@ RUN --mount=type=secret,id=wolfssl_password \
 	make; \
 	make install; \
 	cd /; \
-	rm -rf /usr/src/wolfprov; \
+	rm -rf /usr/src/wolfProvider; \
     \
 	wget -O python.tar.xz "https://www.python.org/ftp/python/${PYTHON_VERSION%%[a-z]*}/Python-$PYTHON_VERSION.tar.xz"; \
 	echo "$PYTHON_SHA256 *python.tar.xz" | sha256sum -c -; \
