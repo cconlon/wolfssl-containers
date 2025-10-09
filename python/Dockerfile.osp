@@ -76,6 +76,7 @@ RUN --mount=type=secret,id=wolfssl_password \
 	\
 	# Compile and install wolfSSL
 	cd /usr/src/wolfssl; \
+    # Prevent wolfSSL from enabling WOLFSSL_OLD_OID_SUM (no longer needed)
     sed -i '/^#ifdef WOLFSSL_PYTHON/,/^#endif/d' wolfssl/wolfcrypt/settings.h; \
 	# NO_INT128 required due to type conflict with bluetooth.h
 	./configure --enable-opensslall --enable-tls13 --enable-tlsx --enable-crl \
