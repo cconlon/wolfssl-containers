@@ -46,6 +46,7 @@ wolfssl-openjdk-fips-root/
 ├── docker-entrypoint.sh            # Container entry point script
 ├── java.security                   # FIPS Java security configuration
 ├── java.security.original          # Original Java security configuration
+├── krb5.conf                       # FIPS Kerberos configuration (AES only)
 ├── scripts/                        # Utility scripts
 │   └── integrity-check.sh          # Library integrity verification script
 └── src/
@@ -63,6 +64,8 @@ When built, the container organizes files as follows:
 
 ```
 /
+├── etc/
+│   └── krb5.conf                   # FIPS Kerberos configuration
 ├── usr/
 │   ├── lib/
 │   │   └── jni/                    # JNI libraries
@@ -291,6 +294,34 @@ them from java.security.
 5. Set JVM module access flags for filtered provider reflection
 6. Convert system cacerts from JKS to WKS format for FIPS compliance
 7. Set default KeyStore type to WKS for FIPS compliance
+8. Configure Kerberos (krb5) to use only FIPS-compliant encryption types
+
+### Kerberos Configuration
+
+The container includes a FIPS-compliant Kerberos configuration file
+(`/etc/krb5.conf`) that restricts Kerberos to use only AES-based encryption
+types. This is necessary because the default Java Kerberos implementation
+attempts to generate keys for all encryption types including DES, 3DES, and
+RC4, which are not within the wolfCrypt FIPS boundary.
+
+**Permitted Encryption Types:**
+- `aes256-cts-hmac-sha1-96` (etype 18)
+- `aes128-cts-hmac-sha1-96` (etype 17)
+
+**Disabled Encryption Types:**
+- DES-CBC-CRC (etype 1)
+- DES-CBC-MD5 (etype 3)
+- DES3-CBC-SHA1 (etype 16)
+- RC4-HMAC (etype 23)
+- All other non-AES encryption types
+
+The configuration also sets `allow_weak_crypto = false` to prevent fallback
+to weak encryption algorithms. Applications using Kerberos will automatically
+inherit these restrictions.
+
+**Note:** Applications that override the system krb5.conf with their own
+configuration should ensure they only permit AES-based encryption types to
+maintain FIPS compliance.
 
 ### WolfSSLKeyStore (WKS) Format
 

@@ -287,6 +287,13 @@ RUN cp $JAVA_HOME/conf/security/java.security $JAVA_HOME/conf/security/java.secu
 COPY java.security $JAVA_HOME/conf/security/java.security
 RUN chmod 644 $JAVA_HOME/conf/security/java.security
 
+# Copy FIPS 140-3 compliant Kerberos configuration.
+# This restricts Kerberos to use only AES encryption types (aes256-cts,
+# aes128-cts) which are supported by wolfCrypt FIPS Certificate #4718.
+# DES, 3DES, and RC4 are excluded as they are not within the FIPS boundary.
+COPY krb5.conf /etc/krb5.conf
+RUN chmod 644 /etc/krb5.conf
+
 # Copy scripts and set permissions
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 COPY scripts/integrity-check.sh /usr/local/bin/integrity-check.sh
