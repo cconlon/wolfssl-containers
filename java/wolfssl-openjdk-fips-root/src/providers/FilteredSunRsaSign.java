@@ -43,7 +43,9 @@ public class FilteredSunRsaSign extends Provider {
 
     public FilteredSunRsaSign() {
 
-        super("FilteredSunRsaSign", 1.0,
+        super("FilteredSunRsaSign",
+            Double.parseDouble(
+                System.getProperty("java.specification.version")),
             "Filtered SunRsaSign for non-crypto ops");
 
         try {
