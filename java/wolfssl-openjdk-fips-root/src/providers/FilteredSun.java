@@ -46,7 +46,10 @@ public class FilteredSun extends Provider {
 
     public FilteredSun() {
 
-        super("FilteredSun", 1.0, "Filtered SUN for non-crypto ops");
+        super("FilteredSun",
+            Double.parseDouble(
+                System.getProperty("java.specification.version")),
+            "Filtered SUN for non-crypto ops");
 
         try {
             System.err.println("Loading original SUN...");

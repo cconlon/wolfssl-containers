@@ -45,7 +45,10 @@ public class FilteredSunEC extends Provider {
 
     public FilteredSunEC() {
 
-        super("FilteredSunEC", 1.0, "Filtered SunEC for non-crypto ops");
+        super("FilteredSunEC",
+            Double.parseDouble(
+                System.getProperty("java.specification.version")),
+            "Filtered SunEC for non-crypto ops");
 
         try {
             System.err.println("Loading original SunEC...");

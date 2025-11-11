@@ -75,12 +75,16 @@ RUN --mount=type=secret,id=wolfssl_pw \
 # We run the wolfCrypt test app to verify native crypto is working after
 # library build.
 # Disabling MD5 since is not a FIPS validated algorithm in cert 4718.
+# Manually adding HAVE_CTS to CFLAGS to enable AES-CTS. wolfSSL versions
+# > 5.8.2 will automatically have this enabled with --enable-jni.
+# Manually adding WOLFSSL_PUBLIC_MP for RSA KeyFactory support. <= 5.8.2
+# did not add this into --enable-jni yet.
 WORKDIR /build/wolfssl
 RUN ./configure \
         --enable-fips=v5 \
         --enable-jni \
         --disable-md5 \
-        --prefix=/usr/local \
+        --prefix=/usr/local CFLAGS="-DHAVE_CTS -DWOLFSSL_PUBLIC_MP" \
     && make -j$(nproc) \
     && echo "Updating FIPS in-core integrity check hash..." \
     && ./fips-hash.sh \
@@ -218,12 +222,13 @@ COPY --from=wolfjsse-builder /build/artifacts/jar/wolfssl-jsse.jar /usr/share/ja
 # Copy and compile Java source files
 COPY src/main/FipsInitCheck.java /build/src/main/
 COPY src/providers/*.java /build/src/providers/
+COPY src/META-INF /build/META-INF
 
 # Compile main application and filtered providers
 RUN mkdir -p /build/classes \
     && javac -cp "/usr/share/java/*" -d /build/classes /build/src/main/FipsInitCheck.java \
     && javac -cp "/usr/share/java/*" -d /build/classes /build/src/providers/*.java \
-    && jar cvf /build/filtered-providers.jar -C /build/classes com
+    && jar cvf /build/filtered-providers.jar -C /build/classes com -C /build META-INF
 
 # ------------------------------------------------------------------------------
 # Stage 6: Runtime Image
@@ -287,6 +292,13 @@ RUN cp $JAVA_HOME/conf/security/java.security $JAVA_HOME/conf/security/java.secu
 COPY java.security $JAVA_HOME/conf/security/java.security
 RUN chmod 644 $JAVA_HOME/conf/security/java.security
 
+# Copy FIPS 140-3 compliant Kerberos configuration.
+# This restricts Kerberos to use only AES encryption types (aes256-cts,
+# aes128-cts) which are supported by wolfCrypt FIPS Certificate #4718.
+# DES, 3DES, and RC4 are excluded as they are not within the FIPS boundary.
+COPY krb5.conf /etc/krb5.conf
+RUN chmod 644 /etc/krb5.conf
+
 # Copy scripts and set permissions
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 COPY scripts/integrity-check.sh /usr/local/bin/integrity-check.sh
@@ -300,6 +312,13 @@ ENV WOLFJCE_DEBUG=false
 ENV WOLFJSSE_DEBUG=false
 ENV WOLFJSSE_ENGINE_DEBUG=false
 ENV FIPS_CHECK=true
+
+# Set CLASSPATH to include provider JARs for ServiceLoader compatibility
+# ServiceLoader only scans the application classpath, not bootclasspath
+# NOTE: The entrypoint script (docker-entrypoint.sh) will automatically
+# append these JARs to any user-provided CLASSPATH to ensure ServiceLoader
+# support even when users set custom classpaths
+ENV CLASSPATH="/usr/share/java/wolfcrypt-jni.jar:/usr/share/java/wolfssl-jsse.jar:/usr/share/java/filtered-providers.jar"
 
 # JVM flags for the filtered providerw which wrap Sun providers for non-crypto
 # services. These flags are required because FilteredSun* providers use
