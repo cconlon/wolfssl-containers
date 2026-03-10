@@ -89,10 +89,28 @@ ENV JAVA_TOOL_OPTIONS="-Xbootclasspath/a:/usr/share/java/wolfcrypt-jni.jar:/usr/
   --add-exports=java.base/sun.security.rsa=ALL-UNNAMED \
   --add-exports=jdk.crypto.ec/sun.security.ec=ALL-UNNAMED"
 
-# Symlink native libs
+# Symlink native libs (must be before WKS conversion which loads wolfJCE)
 RUN ln -sf /usr/lib/jni/libwolfssljni.so /usr/local/openjdk-19/lib/libwolfssljni.so && \
   ln -sf /usr/lib/jni/libwolfcryptjni.so /usr/local/openjdk-19/lib/libwolfcryptjni.so && \
   ln -sf /usr/local/lib/libwolfssl.so /usr/local/openjdk-19/lib/libwolfssl.so
+
+# Stage 2 of PKCS12→WKS: compile WksImport with wolfJCE (FIPS JDK)
+# and convert PEM exports (from builder stage) into .wks keystores.
+# The builder exported each .p12 to a .p12.pem/ directory with PEM
+# files and an aliases.txt manifest.
+RUN javac --release 17 \
+      -cp /usr/share/java/wolfcrypt-jni.jar:/usr/share/java/wolfssl-jsse.jar:/usr/share/java/filtered-providers.jar \
+      WksImport.java -d /tmp/wksimport && \
+    SSL_RES="handler/src/test/resources/io/netty/handler/ssl" && \
+    for pemdir in ${SSL_RES}/*.p12.pem; do \
+      [ -d "$pemdir" ] || continue; \
+      base="${pemdir%.p12.pem}"; \
+      wks="${base}.wks"; \
+      p=$(cat "${pemdir}/password.txt"); \
+      echo "  WKS: $(basename "$wks")"; \
+      java -cp /tmp/wksimport WksImport "$pemdir" "$wks" "$p"; \
+    done && \
+    rm -rf /tmp/wksimport WksImport.java
 
 # Test runner script (embedded)
 RUN cat > /app/run-tests.sh <<'EOF' && chmod +x /app/run-tests.sh

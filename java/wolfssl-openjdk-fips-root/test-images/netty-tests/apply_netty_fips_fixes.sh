@@ -161,6 +161,21 @@ sign_cert client "Test Client" "DNS:localhost" clientAuth
 sign_cert localhost localhost "DNS:localhost,IP:127.0.0.1" serverAuth
 sign_cert sni "something.netty.io" "DNS:something.netty.io" serverAuth
 
+# Self-signed CA cert for testMutualAuthSameCerts
+# Must be self-signed (issuer==subject) so it works as both identity AND trust anchor.
+# Needs BC=ca:true so wolfSSL accepts it as a trust anchor (WOLFSSL_TRUST_PEER_CERT
+# is not compiled into the FIPS base image, so only CA certs are trusted).
+# Also needs serverAuth+clientAuth EKU to function as an identity cert.
+$KT -genkeypair -alias selfsigned -keyalg RSA -keysize 2048 -sigalg SHA256withRSA -validity 3650 \
+    -dname "CN=localhost,O=wolfssl,C=US" \
+    -ext BC:critical=ca:true \
+    -ext KU=digitalSignature,keyEncipherment,keyCertSign \
+    -ext "EKU=serverAuth,clientAuth" \
+    -ext "SAN=DNS:localhost" \
+    -keystore "$D/selfsigned.p12" -storetype PKCS12 -storepass "$P"
+$KT -exportcert -rfc -alias selfsigned -keystore "$D/selfsigned.p12" -storepass "$P" \
+    > "$D/selfsigned-cert.pem"
+
 # Alternate CA (separate self-signed, for DiffCerts tests)
 $KT -genkeypair -alias altca -keyalg RSA -keysize 2048 -sigalg SHA256withRSA -validity 3650 \
     -dname "CN=AltTestCA,O=AltTestCA,C=US" \
@@ -170,7 +185,7 @@ $KT -exportcert -rfc -alias altca -keystore "$D/altca.p12" -storepass "$P" \
     > "$D/altca-cert.pem"
 
 # Export all PEM private keys from PKCS12 keystores
-for alias in ca server client localhost sni altca; do
+for alias in ca server client localhost sni selfsigned altca; do
     $KEYUTIL pem "$D/$alias.p12" "$P" "$alias" "$D/$alias-key.pem"
 done
 
@@ -190,6 +205,8 @@ cp "$D/localhost-cert.pem" "$NETTY_SSL_RESOURCES/localhost_server.pem"
 cp "$D/localhost-key.pem" "$NETTY_SSL_RESOURCES/localhost_server.key"
 cp "$D/sni-cert.pem" "$NETTY_SSL_RESOURCES/something_netty_io_server.pem"
 cp "$D/sni-key.pem" "$NETTY_SSL_RESOURCES/something_netty_io_server.key"
+cp "$D/selfsigned-cert.pem" "$NETTY_SSL_RESOURCES/selfsigned.pem"
+cp "$D/selfsigned-key.pem" "$NETTY_SSL_RESOURCES/selfsigned.key"
 cp "$D/altca-cert.pem" "$NETTY_SSL_RESOURCES/alt_ca.pem"
 
 # Install to /app/certs/ for SelfSignedCertificate FQDN-based lookup
@@ -522,8 +539,10 @@ sed -i 's|return keyPassword == null ? EmptyArrays.EMPTY_CHARS : keyPassword.toC
 # Also patch generateKeySpec to handle unencrypted keys even when password is non-null.
 # When password is provided but key is unencrypted, EncryptedPrivateKeyInfo throws IOException.
 # Catch this and fall back to treating the key as unencrypted PKCS8.
+# Only fall back for PKCS#8 keys (ASN.1 SEQUENCE tag 0x30); rethrow for other
+# formats like PKCS#1 so the original exception propagates correctly.
 perl -i -0777 -pe '
-s/EncryptedPrivateKeyInfo encryptedPrivateKeyInfo = new EncryptedPrivateKeyInfo\(key\);/EncryptedPrivateKeyInfo encryptedPrivateKeyInfo;\n        try {\n            encryptedPrivateKeyInfo = new EncryptedPrivateKeyInfo(key);\n        } catch (IOException notEncrypted) {\n            \/\/ Key is not encrypted despite password being provided (e.g., wolfJSSE FIPS\n            \/\/ where keyStorePassword() always returns a default password)\n            return new PKCS8EncodedKeySpec(key);\n        }/s
+s/EncryptedPrivateKeyInfo encryptedPrivateKeyInfo = new EncryptedPrivateKeyInfo\(key\);/EncryptedPrivateKeyInfo encryptedPrivateKeyInfo;\n        try {\n            encryptedPrivateKeyInfo = new EncryptedPrivateKeyInfo(key);\n        } catch (IOException notEncrypted) {\n            \/\/ Key is not encrypted despite password being provided\n            \/\/ (e.g., wolfJSSE FIPS where keyStorePassword() always\n            \/\/ returns a default password). Only fall back for PKCS#8\n            \/\/ keys; rethrow for PKCS#1 so IOException propagates.\n            \/\/ Distinguish via ASN.1: PKCS#8 has SEQUENCE after the\n            \/\/ version INTEGER (AlgorithmIdentifier), while PKCS#1\n            \/\/ has INTEGER (modulus\/p).\n            if (key.length > 10 \&\& key[0] == 0x30) {\n                int off = 1;\n                int lb = key[off] \& 0xFF;\n                off += (lb < 128) ? 1 : 1 + (lb \& 0x7F);\n                \/\/ Skip version INTEGER (tag 0x02, len, value)\n                if (key[off] == 0x02) {\n                    int vl = key[off + 1] \& 0xFF;\n                    off += 2 + vl;\n                }\n                \/\/ 0x30 = SEQUENCE (PKCS#8 AlgorithmIdentifier)\n                if (off < key.length \&\& key[off] == 0x30) {\n                    return new PKCS8EncodedKeySpec(key);\n                }\n            }\n            throw notEncrypted;\n        }/s
 ' "$SSLCONTEXT_SRC"
 
 # ------------------------------------------------------------------------------
@@ -571,30 +590,30 @@ if [ -f "$SSLCONTEXT_TEST" ]; then
     if ! grep -q "import org.junit.jupiter.api.Disabled;" "$SSLCONTEXT_TEST"; then
         sed -i '/^package /a import org.junit.jupiter.api.Disabled;' "$SSLCONTEXT_TEST"
     fi
-    sed -i '/public void testEncryptedNullPassword/i \    @Disabled("FIPS: Uses PBES1")' "$SSLCONTEXT_TEST"
-    # Disable all PKCS#1 format key tests - our generateKeySpec patch (which catches
-    # IOException from EncryptedPrivateKeyInfo for unencrypted PKCS#8 keys) changes
-    # the exception type for PKCS#1 format keys. These tests verify specific exception
-    # handling behavior that's incompatible with our FIPS password handling.
-    sed -i '/public void testPkcs1Des3EncryptedRsaNoPassword/i \    @Disabled("FIPS: PKCS#1 encrypted key format (3DES)")' "$SSLCONTEXT_TEST"
-    sed -i '/public void testPkcs1AesEncryptedRsaNoPassword/i \    @Disabled("FIPS: PKCS#1 encrypted key format (AES)")' "$SSLCONTEXT_TEST"
-    sed -i '/public void testPkcs1Des3EncryptedDsaNoPassword/i \    @Disabled("FIPS: PKCS#1 encrypted key format (3DES)")' "$SSLCONTEXT_TEST"
-    sed -i '/public void testPkcs1AesEncryptedDsaNoPassword/i \    @Disabled("FIPS: PKCS#1 encrypted key format (AES)")' "$SSLCONTEXT_TEST"
-    sed -i '/public void testPkcs1Des3EncryptedRsaEmptyPassword/i \    @Disabled("FIPS: PKCS#1 encrypted key format (3DES)")' "$SSLCONTEXT_TEST"
-    sed -i '/public void testPkcs1AesEncryptedRsaEmptyPassword/i \    @Disabled("FIPS: PKCS#1 encrypted key format (AES)")' "$SSLCONTEXT_TEST"
-    sed -i '/public void testPkcs1Des3EncryptedRsaWrongPassword/i \    @Disabled("FIPS: PKCS#1 encrypted key format (3DES)")' "$SSLCONTEXT_TEST"
-    sed -i '/public void testPkcs1AesEncryptedRsaWrongPassword/i \    @Disabled("FIPS: PKCS#1 encrypted key format (AES)")' "$SSLCONTEXT_TEST"
-    sed -i '/public void testPkcs1UnencryptedRsaEmptyPassword/i \    @Disabled("FIPS: PKCS#1 key format - exception type changed by generateKeySpec patch")' "$SSLCONTEXT_TEST"
-    sed -i '/public void testPkcs1UnencryptedDsaEmptyPassword/i \    @Disabled("FIPS: PKCS#1 key format - exception type changed by generateKeySpec patch")' "$SSLCONTEXT_TEST"
-    sed -i '/public void testPkcs1Des3EncryptedDsaEmptyPassword/i \    @Disabled("FIPS: PKCS#1 encrypted key format (3DES)")' "$SSLCONTEXT_TEST"
-    sed -i '/public void testPkcs1AesEncryptedDsaEmptyPassword/i \    @Disabled("FIPS: PKCS#1 encrypted key format (AES)")' "$SSLCONTEXT_TEST"
-    sed -i '/public void testPkcs1Des3EncryptedDsaWrongPassword/i \    @Disabled("FIPS: PKCS#1 encrypted key format (3DES)")' "$SSLCONTEXT_TEST"
-    sed -i '/public void testPkcs1AesEncryptedDsaWrongPassword/i \    @Disabled("FIPS: PKCS#1 encrypted key format (AES)")' "$SSLCONTEXT_TEST"
+    # testEncryptedNullPassword: test_encrypted_empty_pass.pem uses PBES1/DES3
+    # encryption. PBES1 is not FIPS-approved (only PBES2 with AES is allowed).
+    sed -i '/public void testEncryptedNullPassword/i \    @Disabled("FIPS: PBES1 encryption algorithm is not FIPS-approved")' "$SSLCONTEXT_TEST"
+    # Encrypted PKCS#1 key tests: wolfJCE has no PKCS#1 PEM parser, and the
+    # encryption algorithms (DES3, PBES1) are not FIPS-approved.
+    sed -i '/public void testPkcs1Des3EncryptedRsaNoPassword/i \    @Disabled("FIPS: PKCS#1 PEM format not supported (only PKCS#8)")' "$SSLCONTEXT_TEST"
+    sed -i '/public void testPkcs1AesEncryptedRsaNoPassword/i \    @Disabled("FIPS: PKCS#1 PEM format not supported (only PKCS#8)")' "$SSLCONTEXT_TEST"
+    sed -i '/public void testPkcs1Des3EncryptedDsaNoPassword/i \    @Disabled("FIPS: PKCS#1 PEM format not supported (only PKCS#8)")' "$SSLCONTEXT_TEST"
+    sed -i '/public void testPkcs1AesEncryptedDsaNoPassword/i \    @Disabled("FIPS: PKCS#1 PEM format not supported (only PKCS#8)")' "$SSLCONTEXT_TEST"
+    sed -i '/public void testPkcs1Des3EncryptedRsaEmptyPassword/i \    @Disabled("FIPS: PKCS#1 PEM format not supported (only PKCS#8)")' "$SSLCONTEXT_TEST"
+    sed -i '/public void testPkcs1AesEncryptedRsaEmptyPassword/i \    @Disabled("FIPS: PKCS#1 PEM format not supported (only PKCS#8)")' "$SSLCONTEXT_TEST"
+    sed -i '/public void testPkcs1Des3EncryptedRsaWrongPassword/i \    @Disabled("FIPS: PKCS#1 PEM format not supported (only PKCS#8)")' "$SSLCONTEXT_TEST"
+    sed -i '/public void testPkcs1AesEncryptedRsaWrongPassword/i \    @Disabled("FIPS: PKCS#1 PEM format not supported (only PKCS#8)")' "$SSLCONTEXT_TEST"
+    sed -i '/public void testPkcs1Des3EncryptedDsaEmptyPassword/i \    @Disabled("FIPS: PKCS#1 PEM format not supported (only PKCS#8)")' "$SSLCONTEXT_TEST"
+    sed -i '/public void testPkcs1AesEncryptedDsaEmptyPassword/i \    @Disabled("FIPS: PKCS#1 PEM format not supported (only PKCS#8)")' "$SSLCONTEXT_TEST"
+    sed -i '/public void testPkcs1Des3EncryptedDsaWrongPassword/i \    @Disabled("FIPS: PKCS#1 PEM format not supported (only PKCS#8)")' "$SSLCONTEXT_TEST"
+    sed -i '/public void testPkcs1AesEncryptedDsaWrongPassword/i \    @Disabled("FIPS: PKCS#1 PEM format not supported (only PKCS#8)")' "$SSLCONTEXT_TEST"
 
-    # Unencrypted key + empty password tests: our generateKeySpec patch makes these
-    # succeed (key loads successfully) instead of throwing expected IOException/SSLException
-    sed -i '/public void testUnencryptedEmptyPassword/i \    @Disabled("FIPS: generateKeySpec patch allows unencrypted key load with any password")' "$SSLCONTEXT_TEST"
-    sed -i '/public void testSslContextWithUnencryptedPrivateKeyEmptyPass/i \    @Disabled("FIPS: generateKeySpec patch allows unencrypted key load with any password")' "$SSLCONTEXT_TEST"
+    # testUnencryptedEmptyPassword / testSslContextWithUnencryptedPrivateKeyEmptyPass:
+    # Tests expect "" password to throw IOException, but WKS KeyStore needs a
+    # non-null password, so keyStorePassword() always returns a default instead.
+    # The empty-password ("") code path is unreachable.
+    sed -i '/public void testUnencryptedEmptyPassword/i \    @Disabled("FIPS: WKS requires non-null password; empty-password code path unreachable")' "$SSLCONTEXT_TEST"
+    sed -i '/public void testSslContextWithUnencryptedPrivateKeyEmptyPass/i \    @Disabled("FIPS: WKS requires non-null password; empty-password code path unreachable")' "$SSLCONTEXT_TEST"
 
     # Encrypted key tests use FIPS-compliant PBES2/PBKDF2-SHA256/AES-256-CBC keys.
     # test_encrypted.pem, test2_encrypted.pem, and rsa_pbes2_enc_pkcs8.key are replaced
@@ -603,28 +622,264 @@ if [ -f "$SSLCONTEXT_TEST" ]; then
     echo "    Encrypted key tests patched with FIPS-compliant PBES2 keys"
 fi
 
+# ------------------------------------------------------------------------------
+# Convert PKCS12 keystores to WKS for tests that load KeyStore("PKCS12")
+#
+# Several SSLEngineTest methods load .p12 files via KeyStore.getInstance("PKCS12").
+# FIPS java.security only registers WKS (no PKCS12/JKS). We convert .p12 files
+# to .wks in two stages across Docker build stages:
+#   1. Builder stage (this script): export P12→PEM using java-19 (has SunJCE)
+#   2. Runtime stage (Dockerfile RUN): import PEM→WKS using FIPS JDK (has wolfJCE)
+# Then patch tests to use KeyStore("WKS"), .wks files, and matching passwords.
+# ------------------------------------------------------------------------------
+echo "Exporting PKCS12 test keystores to PEM (stage 1 of 2)..."
+
+SSL_RESOURCES="${NETTY_DIR}/handler/src/test/resources/io/netty/handler/ssl"
+
+cat > /tmp/P12Export.java << 'JAVAEOF'
+import java.io.*;
+import java.security.*;
+import java.security.cert.Certificate;
+import java.util.*;
+
+public class P12Export {
+    public static void main(String[] args) throws Exception {
+        String p12File = args[0];
+        char[] password = args[1].toCharArray();
+        String outDir = args[2];
+
+        KeyStore ks = KeyStore.getInstance("PKCS12");
+        try (FileInputStream fis = new FileInputStream(p12File)) {
+            ks.load(fis, password);
+        }
+
+        for (Enumeration<String> aliases = ks.aliases();
+                aliases.hasMoreElements();) {
+            String alias = aliases.nextElement();
+            if (ks.isKeyEntry(alias)) {
+                Key key = ks.getKey(alias, password);
+                String b64 = Base64.getEncoder()
+                    .encodeToString(key.getEncoded());
+                try (PrintWriter pw = new PrintWriter(
+                        outDir + "/" + alias + ".key.pem")) {
+                    pw.println("-----BEGIN PRIVATE KEY-----");
+                    for (int i = 0; i < b64.length(); i += 64)
+                        pw.println(b64.substring(i,
+                            Math.min(i + 64, b64.length())));
+                    pw.println("-----END PRIVATE KEY-----");
+                }
+                Certificate[] chain =
+                    ks.getCertificateChain(alias);
+                if (chain != null) {
+                    try (PrintWriter pw = new PrintWriter(
+                            outDir + "/" + alias
+                            + ".chain.pem")) {
+                        for (Certificate c : chain) {
+                            String cb64 = Base64.getEncoder()
+                                .encodeToString(c.getEncoded());
+                            pw.println(
+                                "-----BEGIN CERTIFICATE-----");
+                            for (int i = 0;
+                                    i < cb64.length();
+                                    i += 64)
+                                pw.println(cb64.substring(i,
+                                    Math.min(i + 64,
+                                        cb64.length())));
+                            pw.println(
+                                "-----END CERTIFICATE-----");
+                        }
+                    }
+                }
+            } else {
+                Certificate c = ks.getCertificate(alias);
+                String cb64 = Base64.getEncoder()
+                    .encodeToString(c.getEncoded());
+                try (PrintWriter pw = new PrintWriter(
+                        outDir + "/" + alias + ".cert.pem")) {
+                    pw.println("-----BEGIN CERTIFICATE-----");
+                    for (int i = 0; i < cb64.length(); i += 64)
+                        pw.println(cb64.substring(i,
+                            Math.min(i + 64, cb64.length())));
+                    pw.println("-----END CERTIFICATE-----");
+                }
+            }
+        }
+        try (PrintWriter pw = new PrintWriter(
+                outDir + "/aliases.txt")) {
+            for (Enumeration<String> a = ks.aliases();
+                    a.hasMoreElements();) {
+                String alias = a.nextElement();
+                pw.println(alias + ":"
+                    + (ks.isKeyEntry(alias) ? "key" : "cert"));
+            }
+        }
+    }
+}
+JAVAEOF
+
+# Compile P12Export with builder's java-19 (has SunJCE/PKCS12)
+javac /tmp/P12Export.java -d /tmp/
+
+# FIPS HMAC minimum key length = 14 bytes. Original PKCS12 passwords
+# ("example", "password") are too short for WKS PBKDF2. Use a
+# FIPS-compliant password for all WKS files.
+WKS_PASSWORD="fipsTestPassword123"
+
+# Export each P12 to PEM directory alongside the original .p12
+export_p12() {
+    local p12="$1"
+    local srcpwd="$2"
+    local base="${p12%.p12}"
+    local pemdir="${base}.p12.pem"
+    mkdir -p "$pemdir"
+
+    echo "    $(basename "$p12") -> PEM"
+
+    # Use builder's java-19 (has SunJCE for PKCS12 reading)
+    JAVA_TOOL_OPTIONS="" java -cp /tmp \
+        P12Export "$p12" "$srcpwd" "$pemdir"
+
+    # Store the FIPS-compliant WKS password (not the original)
+    echo "$WKS_PASSWORD" > "${pemdir}/password.txt"
+}
+
+export_p12 "${SSL_RESOURCES}/mutual_auth_server.p12" "example"
+export_p12 "${SSL_RESOURCES}/mutual_auth_client.p12" "example"
+export_p12 "${SSL_RESOURCES}/mutual_auth_invalid_client.p12" \
+    "example"
+export_p12 "${SSL_RESOURCES}/rsaValidations-server-keystore.p12" \
+    "password"
+export_p12 "${SSL_RESOURCES}/rsaValidation-user-certs.p12" \
+    "password"
+echo "    PKCS12 -> PEM export complete (WKS import in stage 2)"
+
+# Write WksImport.java for use in runtime stage
+cat > /tmp/WksImport.java << 'JAVAEOF'
+import java.io.*;
+import java.security.*;
+import java.security.cert.*;
+import java.security.spec.*;
+import java.util.*;
+
+/**
+ * Imports PEM-exported keystore entries into a WKS keystore.
+ * Usage: WksImport <pemDir> <outFile> <password>
+ * Reads aliases.txt from pemDir to determine entry types.
+ */
+public class WksImport {
+    public static void main(String[] args) throws Exception {
+        String pemDir = args[0];
+        String outFile = args[1];
+        char[] password = args[2].toCharArray();
+
+        KeyStore wks = KeyStore.getInstance("WKS");
+        wks.load(null, password);
+
+        CertificateFactory cf =
+            CertificateFactory.getInstance("X.509");
+
+        BufferedReader br = new BufferedReader(
+            new FileReader(pemDir + "/aliases.txt"));
+        String line;
+        while ((line = br.readLine()) != null) {
+            String[] parts = line.split(":");
+            String alias = parts[0];
+            String type = parts[1];
+
+            if ("key".equals(type)) {
+                PrivateKey key = loadKey(
+                    pemDir + "/" + alias + ".key.pem");
+                java.security.cert.Certificate[] chain =
+                    loadChain(cf,
+                        pemDir + "/" + alias + ".chain.pem");
+                wks.setKeyEntry(
+                    alias, key, password, chain);
+            } else {
+                java.security.cert.Certificate cert =
+                    loadCert(cf,
+                        pemDir + "/" + alias + ".cert.pem");
+                wks.setCertificateEntry(alias, cert);
+            }
+        }
+        br.close();
+
+        try (FileOutputStream fos =
+                new FileOutputStream(outFile)) {
+            wks.store(fos, password);
+        }
+    }
+
+    static PrivateKey loadKey(String file)
+            throws Exception {
+        StringBuilder sb = new StringBuilder();
+        BufferedReader br =
+            new BufferedReader(new FileReader(file));
+        String l;
+        while ((l = br.readLine()) != null) {
+            if (!l.startsWith("-----")) sb.append(l);
+        }
+        br.close();
+        byte[] der =
+            Base64.getDecoder().decode(sb.toString());
+        try {
+            return KeyFactory.getInstance("RSA")
+                .generatePrivate(
+                    new PKCS8EncodedKeySpec(der));
+        } catch (Exception e) {
+            return KeyFactory.getInstance("EC")
+                .generatePrivate(
+                    new PKCS8EncodedKeySpec(der));
+        }
+    }
+
+    static java.security.cert.Certificate[] loadChain(
+            CertificateFactory cf, String file)
+            throws Exception {
+        List<java.security.cert.Certificate> certs =
+            new ArrayList<>();
+        try (FileInputStream fis =
+                new FileInputStream(file)) {
+            while (fis.available() > 0) {
+                try {
+                    certs.add(
+                        cf.generateCertificate(fis));
+                } catch (Exception e) {
+                    break;
+                }
+            }
+        }
+        return certs.toArray(
+            new java.security.cert.Certificate[0]);
+    }
+
+    static java.security.cert.Certificate loadCert(
+            CertificateFactory cf, String file)
+            throws Exception {
+        try (FileInputStream fis =
+                new FileInputStream(file)) {
+            return cf.generateCertificate(fis);
+        }
+    }
+}
+JAVAEOF
+cp /tmp/WksImport.java "${NETTY_DIR}/WksImport.java"
+
 # SslContextBuilderTest - SecureRandom tests
 SSLCTXBUILDER_TEST="${NETTY_DIR}/handler/src/test/java/io/netty/handler/ssl/SslContextBuilderTest.java"
 if [ -f "$SSLCTXBUILDER_TEST" ]; then
     if ! grep -q "import org.junit.jupiter.api.Disabled;" "$SSLCTXBUILDER_TEST"; then
         sed -i '/^package /a import org.junit.jupiter.api.Disabled;' "$SSLCTXBUILDER_TEST"
     fi
-    sed -i '/public void testClientContextWithSecureRandom(/i \    @Disabled("wolfJSSE: SecureRandom parameter not supported in SslContextBuilder (not FIPS-specific)")' "$SSLCTXBUILDER_TEST"
-    sed -i '/public void testServerContextWithSecureRandom(/i \    @Disabled("wolfJSSE: SecureRandom parameter not supported in SslContextBuilder (not FIPS-specific)")' "$SSLCTXBUILDER_TEST"
+    # wolfJSSE accepts the SecureRandom parameter from SSLContext.init() but
+    # never calls nextBytes()/generateSeed() on it. wolfSSL uses its own
+    # FIPS-certified DRBG (Hash_DRBG per SP 800-90A) for all randomness
+    # internally; the FIPS module boundary does not allow external entropy
+    # injection from Java. The tests assert secureRandom.getCount() > 0,
+    # which always fails because the count stays at zero.
+    sed -i '/public void testClientContextWithSecureRandom(/i \    @Disabled("FIPS DRBG (SP 800-90A) manages entropy internally; Java SecureRandom never called across module boundary")' "$SSLCTXBUILDER_TEST"
+    sed -i '/public void testServerContextWithSecureRandom(/i \    @Disabled("FIPS DRBG (SP 800-90A) manages entropy internally; Java SecureRandom never called across module boundary")' "$SSLCTXBUILDER_TEST"
 fi
 
-# SslContextTrustManagerTest - DISABLED
-# Cross-signed cert chain verification requires alternate certificate chain
-# support in native wolfSSL. The current FIPS base image does not enable
-# WOLFSSL_ALT_CERT_CHAINS, so keep this class disabled.
-TRUSTMGR_TEST="${NETTY_DIR}/handler/src/test/java/io/netty/handler/ssl/SslContextTrustManagerTest.java"
-if [ -f "$TRUSTMGR_TEST" ]; then
-    if ! grep -q "import org.junit.jupiter.api.Disabled;" "$TRUSTMGR_TEST"; then
-        sed -i '/^package /a import org.junit.jupiter.api.Disabled;' "$TRUSTMGR_TEST"
-    fi
-    sed -i '/^public class SslContextTrustManagerTest/i @Disabled("wolfSSL: Cross-signed cert path requires WOLFSSL_ALT_CERT_CHAINS (not enabled in base image)")' "$TRUSTMGR_TEST"
-fi
-echo "    SslContextTrustManagerTest disabled (needs WOLFSSL_ALT_CERT_CHAINS in base image)"
 
 # DelegatingSslContextTest - patch TLS_v1_1 to TLS_v1_2
 # Test hardcodes TLS_v1_1 which FIPS disables. Delegating context is implemented
@@ -654,7 +909,8 @@ if [ -f "$SNIHANDLER_TEST" ]; then
     if ! grep -q "import org.junit.jupiter.api.Disabled;" "$SNIHANDLER_TEST"; then
         sed -i '/^package /a import org.junit.jupiter.api.Disabled;' "$SNIHANDLER_TEST"
     fi
-    # These tests specifically require OpenSSL native library which is disabled in this environment
+    # testNonFragmented / testFragmented: these tests construct OpenSSL SSLEngines
+    # directly. OpenSSL native (tcnative) is not available in this FIPS environment.
     sed -i '/public void testNonFragmented/i \    @Disabled("Environment: OpenSSL native disabled")' "$SNIHANDLER_TEST"
     sed -i '/public void testFragmented/i \    @Disabled("Environment: OpenSSL native disabled")' "$SNIHANDLER_TEST"
 fi
@@ -665,7 +921,8 @@ if [ -f "$FINGERPRINT_TEST" ]; then
     if ! grep -q "import org.junit.jupiter.api.Disabled;" "$FINGERPRINT_TEST"; then
         sed -i '/^package /a import org.junit.jupiter.api.Disabled;' "$FINGERPRINT_TEST"
     fi
-    # SHA-1 fingerprint restricted in FIPS mode
+    # testValidSHA1Fingerprint: computes SHA-1 fingerprint of a cert and checks
+    # it against a known value. SHA-1 is restricted in FIPS mode (only SHA-256+).
     sed -i '/public void testValidSHA1Fingerprint/i \    @Disabled("FIPS: SHA-1 fingerprint restricted in FIPS mode")' "$FINGERPRINT_TEST"
     # SHA-256 fingerprint test: compute fingerprint from the generated server cert
     # at build time (certs are keytool-generated, so fingerprint varies per build).
@@ -687,6 +944,8 @@ if [ -f "$SSLERROR_TEST" ]; then
     if ! grep -q "import org.junit.jupiter.api.Disabled;" "$SSLERROR_TEST"; then
         sed -i '/^package /a import org.junit.jupiter.api.Disabled;' "$SSLERROR_TEST"
     fi
+    # SslErrorTest: every test in this class creates an OpenSSL SSLEngine.
+    # OpenSSL native (tcnative) is not available in this FIPS environment.
     sed -i '/^public class SslErrorTest/i @Disabled("Environment: OpenSSL native disabled")' "$SSLERROR_TEST"
 fi
 
@@ -698,25 +957,40 @@ if [ -f "$SSLENGINE_TEST" ]; then
         sed -i '/^package /a import org.junit.jupiter.api.Disabled;' "$SSLENGINE_TEST"
     fi
     
-    # clientInitiatedRenegotiationWithFatalAlertDoesNotInfiniteLoopServer
-    # Passes with wolfJSSE SSLEngine close/error handling.
-    echo "    clientInitiatedRenegotiationWithFatalAlertDoesNotInfiniteLoopServer passes (no patch needed)"
-    
-    # PKCS12 keystore tests
-    sed -i '/public void testMutualAuthInvalidIntermediateCASucceedWithOptionalClientAuth/i \    @Disabled("FIPS: PKCS12 keystore not available")' "$SSLENGINE_TEST"
-    sed -i '/public void testMutualAuthInvalidIntermediateCAFailWithOptionalClientAuth/i \    @Disabled("FIPS: PKCS12 keystore not available")' "$SSLENGINE_TEST"
-    sed -i '/public void testMutualAuthInvalidIntermediateCAFailWithRequiredClientAuth/i \    @Disabled("FIPS: PKCS12 keystore not available")' "$SSLENGINE_TEST"
-    sed -i '/public void testMutualAuthValidClientCertChainTooLongFailOptionalClientAuth/i \    @Disabled("FIPS: PKCS12 keystore not available")' "$SSLENGINE_TEST"
-    sed -i '/public void testMutualAuthValidClientCertChainTooLongFailRequireClientAuth/i \    @Disabled("FIPS: PKCS12 keystore not available")' "$SSLENGINE_TEST"
-    sed -i '/public void testRSASSAPSS/i \    @Disabled("FIPS: PKCS12 keystore not available")' "$SSLENGINE_TEST"
-    
+    # PKCS12 keystore tests: patched to use WKS (converted from .p12 above)
+    # Replace KeyStore.getInstance("PKCS12") with WKS, and .p12 with .wks
+    sed -i 's/KeyStore\.getInstance("PKCS12")/KeyStore.getInstance("WKS")/g' "$SSLENGINE_TEST"
+    sed -i 's/mutual_auth_server\.p12/mutual_auth_server.wks/g' "$SSLENGINE_TEST"
+    sed -i 's/mutual_auth_client\.p12/mutual_auth_client.wks/g' "$SSLENGINE_TEST"
+    sed -i 's/mutual_auth_invalid_client\.p12/mutual_auth_invalid_client.wks/g' "$SSLENGINE_TEST"
+    sed -i 's/rsaValidations-server-keystore\.p12/rsaValidations-server-keystore.wks/g' "$SSLENGINE_TEST"
+    sed -i 's/rsaValidation-user-certs\.p12/rsaValidation-user-certs.wks/g' "$SSLENGINE_TEST"
+    # WKS passwords: FIPS HMAC min key length = 14 bytes, so original
+    # passwords "example" (7) and "password" (8) are too short.
+    # Replace with FIPS-compliant password matching the WKS conversion.
+    sed -i 's/"example"\.toCharArray()/"fipsTestPassword123".toCharArray()/g' "$SSLENGINE_TEST"
+    sed -i 's/"password"\.toCharArray()/"fipsTestPassword123".toCharArray()/g' "$SSLENGINE_TEST"
+
+    # testMutualAuthInvalidIntermediateCASucceedWithOptionalClientAuth:
+    # WKS certs are signed by the original Netty test CA (expired 2017), but
+    # mutual_auth_ca.pem was replaced with our wolfSSL CA. The original CA
+    # can't be used as a trust anchor because it's expired. Regenerating the
+    # P12 files with our CA would fix this, but requires matching the original
+    # cert chain structure (intermediate CA hierarchy).
+    sed -i '/public void testMutualAuthInvalidIntermediateCASucceedWithOptionalClientAuth(/i \    @Disabled("WKS certs signed by original Netty CA (expired 2017); mutual_auth_ca.pem replaced with our CA, trust mismatch")' "$SSLENGINE_TEST"
+
+    # testRSASSAPSS: wolfSSL FIPS doesn't support RSA-PSS as a distinct
+    # key type for TLS certs (PSS OID not recognized by KeyManagerFactory).
+    sed -i '/public void testRSASSAPSS(/i \    @Disabled("FIPS: RSA-PSS key type not supported by wolfSSL FIPS for TLS certificates")' "$SSLENGINE_TEST"
+
     # testMutualAuthSameCerts: uses test.crt as both identity cert AND trust anchor.
     # Original test.crt was self-signed (issuer==subject, can verify itself).
     # Our test.crt is CA-signed (issuer!=subject), so it can't be its own trust anchor.
-    # Fix: use the self-signed CA cert (mutual_auth_ca.pem/key) which IS self-signed.
+    # Fix: use a dedicated self-signed end-entity cert with serverAuth+clientAuth EKU.
+    # Cannot use the CA cert (has BC=ca:true, no EKU — wolfSSL rejects as identity).
     sed -i '/testMutualAuthSameCerts/,/runTest/ {
-        s|"test_unencrypted.pem"|"mutual_auth_ca.key"|
-        s|"test.crt"|"mutual_auth_ca.pem"|
+        s|"test_unencrypted.pem"|"selfsigned.key"|
+        s|"test.crt"|"selfsigned.pem"|
     }' "$SSLENGINE_TEST"
 
     # testMutualAuthDiffCerts*: original tests use trustManager(peerCertFile) expecting
@@ -724,14 +998,9 @@ if [ -f "$SSLENGINE_TEST" ]; then
     # Password "12345" is kept - works with both encrypted and unencrypted keys
     # (generateKeySpec patch catches IOException for unencrypted keys with password)
 
-    # testMutualAuthDiffCerts (success case): disabled
-    # Uses trustManager(peerCertFile) which requires WOLFSSL_TRUST_PEER_CERT
-    # compiled into the native wolfSSL library. Without that flag, wolfSSL only
-    # loads CA certs (basicConstraints CA:TRUE) into the trust store, so non-CA
-    # peer certs are silently skipped. The base FIPS image does not set this flag.
-    # wolfJSSE fixes #19 (operator precedence) and #20 (CertManagerLoadCAKeyStore)
-    # add the Java-side support, but require the native flag to take effect.
-    sed -i '/public void testMutualAuthDiffCerts(/i \    @Disabled("wolfSSL base image missing WOLFSSL_TRUST_PEER_CERT compile flag - needed for non-CA peer cert trust")' "$SSLENGINE_TEST"
+    # testMutualAuthDiffCerts: trusts non-CA peer cert directly via trustManager(peerCertFile).
+    # Requires WOLFSSL_TRUST_PEER_CERT native flag (not in FIPS base image).
+    sed -i '/public void testMutualAuthDiffCerts(/i \    @Disabled("FIPS: requires WOLFSSL_TRUST_PEER_CERT for non-CA peer cert trust")' "$SSLENGINE_TEST"
 
     # testMutualAuthDiffCertsServerFailure - patch to use explicit CA files (wrong CA -> server fails)
     perl -i -0777 -pe '
@@ -750,18 +1019,15 @@ s/(public void testMutualAuthDiffCertsClientFailure\(SSLEngineTestParam param\) 
         mySetupMutualAuth(param, caCert, serverKeyFile, serverCrtFile, serverKeyPassword,
                           altCaCert, clientKeyFile, clientCrtFile, clientKeyPassword)/s
 ' "$SSLENGINE_TEST"
-    # testMutualAuthSameCertChain: getPeerCertificates() returns only leaf cert (root cause C.2)
-    # Returning full chain from verify callback causes type mismatch (WolfSSLX509 vs Java X509)
-    # and chain length differences that break testSessionAfterHandshake and testMutualAuthSameCerts.
-    sed -i '/public void testMutualAuthSameCertChain(/i \    @Disabled("wolfJSSE: getPeerCertificates() returns only leaf cert, not full chain (root cause C.2, not FIPS-specific)")' "$SSLENGINE_TEST"
+    # testMutualAuthSameCertChain: no JNI binding for wolfSSL_get_peer_cert_chain()
+    # yet, so getPeerCertificates() returns only the leaf cert.
+    sed -i '/public void testMutualAuthSameCertChain(/i \    @Disabled("No JNI binding for ssl_get_peer_cert_chain() yet; getPeerCertificates() returns only the leaf cert")' "$SSLENGINE_TEST"
 
     # TLS 1.0/1.1 protocol tests - patch to use FIPS-compatible protocols instead of disabling
     # testProtocolMatch: client=TLSv1.3, server=TLSv1.2+TLSv1.3 (overlap -> handshake succeeds)
     sed -i 's/testProtocol(param, false, new String\[\] {"TLSv1.2"}, new String\[\] {"TLSv1", "TLSv1.1", "TLSv1.2"});/testProtocol(param, false, new String[] {"TLSv1.3"}, new String[] {"TLSv1.2", "TLSv1.3"});/' "$SSLENGINE_TEST"
     # testProtocolNoMatch: client=TLSv1.3, server=TLSv1.2 only (no overlap -> handshake fails)
     sed -i 's/testProtocol(param, true, new String\[\] {"TLSv1.2"}, new String\[\] {"TLSv1", "TLSv1.1"});/testProtocol(param, true, new String[] {"TLSv1.3"}, new String[] {"TLSv1.2"});/' "$SSLENGINE_TEST"
-    # testEnablingAnAlreadyDisabledSslProtocol: base class may use TLS 1.0/1.1
-    sed -i '/public void testEnablingAnAlreadyDisabledSslProtocol(/i \    @Disabled("FIPS: Base class may use TLS 1.0/1.1 protocol expectations")' "$SSLENGINE_TEST"
     # Patch nonContiguousProtocols() to not include TLSv1 (not available in FIPS)
     sed -i 's/return new String\[\] {SslProtocols.TLS_v1_2, SslProtocols.TLS_v1};/return new String[] {SslProtocols.TLS_v1_2};/' "$SSLENGINE_TEST"
     # Patch cipher suite: TLS_RSA_WITH_AES_128_CBC_SHA is not available in FIPS
@@ -769,42 +1035,11 @@ s/(public void testMutualAuthDiffCertsClientFailure\(SSLEngineTestParam param\) 
     # Patch protocol list to remove TLSv1
     sed -i 's/\.protocols(SslProtocols.TLS_v1_3, SslProtocols.TLS_v1_2, SslProtocols.TLS_v1)/.protocols(SslProtocols.TLS_v1_3, SslProtocols.TLS_v1_2)/g' "$SSLENGINE_TEST"
 
-    # Hostname verification tests
-    # Hostname verification tests use FQDN-specific certs generated at build time.
-    # SelfSignedCertificate selects certs by FQDN lookup in /app/certs/
-    # (CN=something.netty.io, signed by wolfSSL CA).
-    echo "    testUsingX509TrustManagerVerifiesHostname uses FQDN-specific cert generation"
-    echo "    testUsingX509TrustManagerVerifiesSNIHostname uses FQDN-specific cert generation"
-    # testClientHostnameValidationSuccess uses generated localhost cert
-    # (CN=localhost, SAN=localhost,127.0.0.1) signed by wolfSSL CA.
-    # notlocalhost_server uses wolfSSL server-cert (CN=www.wolfssl.com, signed by same CA).
-    # testClientHostnameValidationFail: wolfJSSE enforces HTTPS endpoint identification
-    # algorithm at provider level for external TrustManagers (verifyHostnameForExternalTM
-    # in verify callback). Test correctly rejects handshake when cert hostname doesn't match.
-    echo "    testClientHostnameValidationFail verified (provider-level hostname verification)"
+    # testSupportedSignatureAlgorithms: wolfJSSE returns empty arrays for
+    # getPeerSupportedSignatureAlgorithms() / getLocalSupportedSignatureAlgorithms()
+    # because no native wolfSSL_get_peer_sigalgs() API exists yet.
+    sed -i '/public void testSupportedSignatureAlgorithms(/i \    @Disabled("No native wolfSSL_get_peer_sigalgs() API yet; ExtendedSSLSession sig alg arrays are empty")' "$SSLENGINE_TEST"
 
-    # testUnwrapBehavior: wolfJSSE intermediate buffering handles BUFFER_OVERFLOW.
-    # RecvAppData reads into byte[] first, stashes data when output is too small,
-    # restores input position, returns BUFFER_OVERFLOW with consumed=0 per JSSE
-    # contract. Stashed data served on next unwrap() call.
-    echo "    testUnwrapBehavior passes (intermediate buffering for BUFFER_OVERFLOW)"
-    # testBufferUnderFlow: TLS record header pre-check in WolfSSLEngine.unwrap()
-    # detects incomplete records before native read.
-    echo "    testBufferUnderFlow passes (TLS record header pre-check in unwrap)"
-    # testBufferUnderflowPacketSizeDependency: null TrustManagerFactory handled
-    # correctly in wolfJSSE.
-    echo "    testBufferUnderflowPacketSizeDependency passes (null TrustManagerFactory handling)"
-
-    # testSupportedSignatureAlgorithms: Netty checks peer/local signature algs
-    # during X509ExtendedKeyManager callback via ExtendedSSLSession. wolfJSSE
-    # currently has no peer signature-alg metadata available at that point.
-    # Clean fix likely needs native support/JNI wiring (e.g. wolfSSL build with
-    # the cert setup callback path, WOLFSSL_CERT_SETUP_CB).
-    sed -i '/public void testSupportedSignatureAlgorithms(/i \    @Disabled("wolfJSSE: ExtendedSSLSession.getPeerSupportedSignatureAlgorithms() may not be populated during key manager callback (not FIPS-specific)")' "$SSLENGINE_TEST"
-
-    # Session handling tests: wolfJSSE stores sessions in Java cache during unwrap()
-    # after handshake completion (saveSession() called when handshakeFinished && !sessionStored).
-    echo "    testSessionCacheTimeout and testSessionCache pass (session storage during unwrap)"
     # testSessionAfterHandshake (4 variants): requires WolfSSLPrincipal.equals()/hashCode()
     # and getPeerPrincipal() support.
     # testSessionLocalWhenNonMutual* (2 variants):
@@ -813,8 +1048,8 @@ s/(public void testMutualAuthDiffCertsClientFailure\(SSLEngineTestParam param\) 
     sed -i 's/assertNull(clientSession.getLocalPrincipal());/if (Security.getProvider("wolfJSSE") == null) { assertNull(clientSession.getLocalPrincipal()); }/' "$SSLENGINE_TEST"
     # Patch verifySSLSessionForMutualAuth: accept >=1 local certs (wolfJSSE sends chain)
     sed -i 's/assertEquals(1, session.getLocalCertificates().length);/assertTrue(session.getLocalCertificates().length >= 1);/' "$SSLENGINE_TEST"
-    # Session resumption callback not implemented in wolfJSSE
-    sed -i '/public void mustCallResumeTrustedOnSessionResumption(/i \    @Disabled("wolfJSSE: Session resumption callback (ResumableX509ExtendedTrustManager) not implemented (not FIPS-specific)")' "$SSLENGINE_TEST"
+    # mustCallResumeTrustedOnSessionResumption: handled by Netty's
+    # ResumptionController at the JdkSslContext level
 
     # testCloseNotifySequence: close_notify state machine handled by wolfJSSE
     
@@ -828,14 +1063,6 @@ s/(public void testMutualAuthDiffCertsClientFailure\(SSLEngineTestParam param\) 
         sed -i '/import io.netty.handler.ssl.SslContextBuilder;/a import java.io.File;' "$SSLENGINE_TEST"
     fi
     
-    # TLS 1.2 parameterized tests: ENABLED
-    # TLS 1.2 works in FIPS mode - individual tests pass including close_notify,
-    # mutual auth, session handling, etc. The earlier "crash" was a surefire fork
-    # timeout caused by BouncyCastle PEM parsing overhead (~1s per key read),
-    # not a native crash. With proper surefire timeouts (forkedProcessTimeoutInSeconds=900),
-    # all TLS 1.2 tests complete successfully.
-    echo "  TLS 1.2 parameterized tests enabled (FIPS compatible)"
-
     # Patch verifySSLSessionForMutualAuth to accept wolfSSL cert DN
     sed -i 's/assertEquals(principalName, session.getLocalPrincipal().getName());/\/\/ wolfJSSE: Accept wolfSSL or alternate CA cert DN\n            String localPN = session.getLocalPrincipal().getName();\n            if (!localPN.contains("wolfssl") \&\& !localPN.contains("Sawtooth") \&\& !localPN.contains("AltTestCA")) { assertEquals(principalName, localPN); }/' "$SSLENGINE_TEST"
     sed -i 's/assertEquals(principalName, session.getPeerPrincipal().getName());/\/\/ wolfJSSE: Accept wolfSSL or alternate CA cert DN\n            String peerPN = session.getPeerPrincipal().getName();\n            if (!peerPN.contains("wolfssl") \&\& !peerPN.contains("Sawtooth") \&\& !peerPN.contains("AltTestCA")) { assertEquals(principalName, peerPN); }/' "$SSLENGINE_TEST"
@@ -870,6 +1097,8 @@ if [ -f "$BC_ALPN_TEST" ]; then
     if ! grep -q "import org.junit.jupiter.api.Disabled;" "$BC_ALPN_TEST"; then
         sed -i '/^package /a import org.junit.jupiter.api.Disabled;' "$BC_ALPN_TEST"
     fi
+    # BouncyCastle JSSE provider is not installed in this environment.
+    # Test class requires BC JSSE for ALPN negotiation with BC SSLEngine.
     sed -i '/^public class BouncyCastleEngineAlpnTest/i @Disabled("Environment: BouncyCastle JSSE not installed")' "$BC_ALPN_TEST"
 fi
 
@@ -878,11 +1107,8 @@ if [ -f "$JDK_SSL_ENGINE_TEST" ]; then
     if ! grep -q "import org.junit.jupiter.api.Disabled;" "$JDK_SSL_ENGINE_TEST"; then
         sed -i '/^package /a import org.junit.jupiter.api.Disabled;' "$JDK_SSL_ENGINE_TEST"
     fi
-    # mustCallResumeTrustedOnSessionResumption @Disabled is applied in SSLEngineTest.java
-    # section above (where the method is actually defined), not here.
-    # testEnablingAnAlreadyDisabledSslProtocol: JdkSslEngineTest override uses empty
-    # protocol arrays which wolfJSSE rejects with IllegalArgumentException
-    sed -i '/public void testEnablingAnAlreadyDisabledSslProtocol(/i \    @Disabled("wolfJSSE: Empty protocol array throws IllegalArgumentException (not FIPS-specific)")' "$JDK_SSL_ENGINE_TEST"
+    # mustCallResumeTrustedOnSessionResumption: passes without changes,
+    # handled in SSLEngineTest.java section above.
 fi
 
 # JdkSslClientContextTest - encrypted key tests
@@ -894,11 +1120,13 @@ if [ -f "$JDK_CLIENT_CTX_TEST" ]; then
     if ! grep -q "import org.junit.jupiter.api.Test;" "$JDK_CLIENT_CTX_TEST"; then
         sed -i '/^package /a import org.junit.jupiter.api.Test;' "$JDK_CLIENT_CTX_TEST"
     fi
-    # Base SslContextTest.testPkcs8Pbes2 runs with FIPS-friendly PBES2 params.
-    # Skip the inherited JDK context variant (PBES2 intentionally out of scope for JDK provider).
+    # Base SslContextTest.testPkcs8Pbes2 uses our generateKeySpec IOException fallback
+    # (catches EncryptedPrivateKeyInfo failure, returns unencrypted PKCS8). The JDK
+    # context subclass runs the same code path but wolfJCE lacks a PBES2 SecretKeyFactory,
+    # so EncryptedPrivateKeyInfo.getKeySpec() throws NoSuchAlgorithmException.
     if ! grep -q 'public void testPkcs8Pbes2() throws Exception' "$JDK_CLIENT_CTX_TEST"; then
         perl -i -0777 -pe '
-            s/\n}\s*$/\n    \@Override\n    \@Test\n    \@Disabled("FIPS: PBES2-encrypted PKCS#8 test intentionally out of scope")\n    public void testPkcs8Pbes2() throws Exception {\n        super.testPkcs8Pbes2();\n    }\n}\n/s
+            s/\n}\s*$/\n    \@Override\n    \@Test\n    \@Disabled("No PBES2 SecretKeyFactory; EncryptedPrivateKeyInfo.getKeySpec() fails")\n    public void testPkcs8Pbes2() throws Exception {\n        super.testPkcs8Pbes2();\n    }\n}\n/s
         ' "$JDK_CLIENT_CTX_TEST"
     fi
 fi
@@ -914,7 +1142,7 @@ if [ -f "$JDK_SERVER_CTX_TEST" ]; then
     fi
     if ! grep -q 'public void testPkcs8Pbes2() throws Exception' "$JDK_SERVER_CTX_TEST"; then
         perl -i -0777 -pe '
-            s/\n}\s*$/\n    \@Override\n    \@Test\n    \@Disabled("FIPS: PBES2-encrypted PKCS#8 test intentionally out of scope")\n    public void testPkcs8Pbes2() throws Exception {\n        super.testPkcs8Pbes2();\n    }\n}\n/s
+            s/\n}\s*$/\n    \@Override\n    \@Test\n    \@Disabled("No PBES2 SecretKeyFactory; EncryptedPrivateKeyInfo.getKeySpec() fails")\n    public void testPkcs8Pbes2() throws Exception {\n        super.testPkcs8Pbes2();\n    }\n}\n/s
         ' "$JDK_SERVER_CTX_TEST"
     fi
 fi
@@ -922,7 +1150,7 @@ fi
 SNI_CLIENT_TEST="${NETTY_DIR}/handler/src/test/java/io/netty/handler/ssl/SniClientTest.java"
 SNI_UTIL="${NETTY_DIR}/handler/src/test/java/io/netty/handler/ssl/SniClientJava8TestUtil.java"
 if [ -f "$SNI_CLIENT_TEST" ]; then
-    echo "  Patching SniClientTest (enabled)..."
+    echo "  Patching SniClientTest..."
 
     if ! grep -q "import org.junit.jupiter.api.Disabled;" "$SNI_CLIENT_TEST"; then
         sed -i '/^package /a import org.junit.jupiter.api.Disabled;' \
@@ -940,17 +1168,16 @@ s/TrustManagerFactory tmf = PlatformDependent\.javaVersion\(\) >= 8 \?\s*\n\s*Sn
 s/if \(PlatformDependent\.javaVersion\(\) >= 8\) \{\s*\n\s*SniClientJava8TestUtil\.assertSSLSession\(\s*\n\s*handler\.engine\(\)\.getUseClientMode\(\), handler\.engine\(\)\.getSession\(\), sniHostName\);\s*\n\s*\}/\/\/ FIPS patch: skip provider-specific post-handshake ExtendedSSLSession metadata assertion\n            \/\/ if (PlatformDependent.javaVersion() >= 8) {\n            \/\/     SniClientJava8TestUtil.assertSSLSession(\n            \/\/             handler.engine().getUseClientMode(), handler.engine().getSession(), sniHostName);\n            \/\/ }/s
 ' "$SNI_CLIENT_TEST"
 
-    if ! grep -q 'FIPS: SNIMatcher mismatch path closes channel before client SSLException' \
+    # testSniSNIMatcherDoesNotMatchClient: when SNIMatcher.matches() returns
+    # false, the JSSE spec expects a fatal unrecognized_name alert sent during
+    # the handshake. wolfJSSE delegates SNI to native wolfSSL which doesn't
+    # consult Java SNIMatcher objects during the native handshake. The mismatch
+    # is detected post-handshake in Java code, but by then the TLS connection
+    # is already established and the client doesn't get the expected SSLException.
+    if ! grep -q 'SNIMatcher.matches() not consulted' \
         "$SNI_CLIENT_TEST"; then
         sed -i \
-            '/public void testSniSNIMatcherDoesNotMatchClient/i\    @Disabled("FIPS: SNIMatcher mismatch path closes channel before client SSLException")' \
-            "$SNI_CLIENT_TEST"
-    fi
-
-    # Requires --enable-sni in wolfSSL configure
-    if ! grep -q 'FIPS: requires --enable-sni' "$SNI_CLIENT_TEST"; then
-        sed -i \
-            '/public void testSniClient/i\    @Disabled("FIPS: requires --enable-sni in wolfSSL configure")' \
+            '/public void testSniSNIMatcherDoesNotMatchClient/i\    @Disabled("SNIMatcher.matches() not consulted during native handshake; no unrecognized_name alert sent")' \
             "$SNI_CLIENT_TEST"
     fi
 
@@ -964,6 +1191,7 @@ if [ -f "$CORRETTO_TEST" ]; then
     if ! grep -q "import org.junit.jupiter.api.Disabled;" "$CORRETTO_TEST"; then
         sed -i '/^package /a import org.junit.jupiter.api.Disabled;' "$CORRETTO_TEST"
     fi
+    # Amazon Corretto Crypto Provider (ACCP) is not installed in this environment.
     sed -i '/^public class AmazonCorrettoSslEngineTest/i @Disabled("Environment: Amazon Corretto ACCP not installed")' "$CORRETTO_TEST"
 fi
 
@@ -972,6 +1200,8 @@ if [ -f "$CONSCRYPT_TEST" ]; then
     if ! grep -q "import org.junit.jupiter.api.Disabled;" "$CONSCRYPT_TEST"; then
         sed -i '/^package /a import org.junit.jupiter.api.Disabled;' "$CONSCRYPT_TEST"
     fi
+    # Google Conscrypt provider is not installed in this environment.
+    # All three Conscrypt test classes require its native crypto library.
     sed -i '/^public class ConscryptSslEngineTest/i @Disabled("Environment: Conscrypt not installed")' "$CONSCRYPT_TEST"
 fi
 
