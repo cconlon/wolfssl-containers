@@ -399,7 +399,7 @@ public class FipsInitCheck {
      *
      * This also spot checks algorithms that should not be available in
      * a FIPS validated wolfCrypt are also not available via Java
-     * services (ex: Mac.HmacMD5).
+     * services (ex: Mac.getInstance("HmacMD5")).
      *
      * @throws SecurityException if any algorithm fails to instantiate with
      *         the expected wolfSSL provider.
