@@ -30,7 +30,9 @@ wolfCrypt FIPS 140-3 validated algorithms available for cryptographic services.
 - **wolfSSL JNI/JSSE**: Java Secure Socket Extension (JSSE) provider
 - **Filtered Sun Providers**: Custom wrappers for Sun providers that expose
 non-cryptographic functionality (SunEC, SunRsaSign, SUN) while blocking
-non-FIPS compliant cryptography services and algorithms
+non-FIPS compliant cryptography services and algorithms. Maintained in the
+[wolfcrypt-jni](https://github.com/wolfSSL/wolfcrypt-jni) repository under
+`examples/filtered-providers` and built as part of the wolfcrypt-jni build
 - **WKS cacerts**: System CA certificates converted to WolfSSL KeyStore format
 and protected with read-only file permissions
 
@@ -50,13 +52,15 @@ wolfssl-openjdk-fips-root/
 ├── scripts/                        # Utility scripts
 │   └── integrity-check.sh          # Library integrity verification script
 └── src/
-    ├── main/
-    │   ├── FipsInitCheck.java      # FIPS POST and container tests
-    ├── providers/                  # Custom security providers
-    │   ├── FilteredSun.java        # Filtered SUN provider wrapper
-    │   ├── FilteredSunEC.java      # Filtered SunEC provider wrapper
-    │   └── FilteredSunRsaSign.java # Filtered SunRsaSign provider wrapper
+    └── main/
+        └── FipsInitCheck.java      # FIPS POST and container tests
 ```
+
+The filtered Sun provider wrappers (FilteredSun, FilteredSunEC,
+FilteredSunRsaSign) are maintained in the
+[wolfcrypt-jni](https://github.com/wolfSSL/wolfcrypt-jni) repository under
+`examples/filtered-providers/` and are built into `filtered-providers.jar`
+by the wolfcrypt-jni build stage of this image.
 
 ## Container Structure
 
@@ -83,8 +87,7 @@ When built, the container organizes files as follows:
 ├── opt/
 │   └── wolfssl-fips/
 │       ├── bin/                    # Compiled Java classes
-│       │   ├── FipsInitCheck.class
-│       │   └── com/                # Filtered provider classes
+│       │   └── FipsInitCheck.class
 │       └── checksums/              # FIPS integrity verification
 │           ├── wolfssl.sha256      # Native library checksums
 │           └── providers.sha256    # JAR file checksums
@@ -99,12 +102,19 @@ wolfJCE and wolfJSSE consume several non-cryptographic services from a few
 of the default Sun providers. This dependency exists so wolfJCE and wolfJSSE
 do not need to re-implement stable working functionality from base providers.
 In order to protect Java applications from accidentally using non-FIPS compliant
-cryptographic services from these Sun providers, this container implements
+cryptographic services from these Sun providers, this container installs
 custom filtered provider wrappers that only expose non-cryptographic
 services from these providers. The primary providers are then removed
 from java.security and unregistered. The filtered providers use reflection
 to look up original providers, get appropriate service and alias information,
 then use that to create the delegating services.
+
+The filtered provider sources are maintained in the
+[wolfcrypt-jni](https://github.com/wolfSSL/wolfcrypt-jni) repository under
+`examples/filtered-providers/`. The wolfcrypt-jni `build-jce-release` ant
+target compiles them into `lib/filtered-providers/filtered-providers.jar`,
+which this image's build copies into the runtime image at
+`/usr/share/java/filtered-providers.jar`.
 
 The following list includes the services that are left exposed/available:
 
@@ -135,6 +145,11 @@ properly:
 - `--add-opens=java.base/sun.security.util=ALL-UNNAMED` - UString class for attributes
 - `--add-opens=java.base/sun.security.rsa=ALL-UNNAMED` - SunRsaSign provider classes
 - `-Djava.library.path=/usr/lib/jni:/usr/local/lib` - JNI library path configuration
+
+For detailed per-flag rationale, including the EC flag changes required on
+JDK 22+ (where SunEC moved from `jdk.crypto.ec` into `java.base`), see
+`examples/filtered-providers/docs/add-opens.md` in the wolfcrypt-jni
+repository.
 
 ## Build Process
 
