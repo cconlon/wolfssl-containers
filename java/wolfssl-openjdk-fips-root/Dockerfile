@@ -19,6 +19,13 @@ ARG WOLFCRYPT_JNI_BRANCH="master"
 ARG WOLFSSL_JNI_REPO="https://github.com/wolfSSL/wolfssljni.git"
 ARG WOLFSSL_JNI_BRANCH="master"
 
+# wolfSSL FIPS variant used for the native wolfSSL build.
+# Values select the wolfssl-source-* stage that feeds the wolfssl-builder
+# stage below:
+#   v5.2.3 (default) - password-protected commercial FIPS bundle
+#   ready            - public GPLv3 wolfSSL "FIPS Ready" bundle
+ARG FIPS_VARIANT="v5.2.3"
+
 # ------------------------------------------------------------------------------
 # Stage 1: Build Environment
 # ------------------------------------------------------------------------------
@@ -57,11 +64,15 @@ ENV CLASSPATH=$JUNIT_HOME/junit-4.13.2.jar:$JUNIT_HOME/hamcrest-core-1.3.jar
 # ------------------------------------------------------------------------------
 # Stage 2: Build Native wolfSSL FIPS 140-3 library
 # ------------------------------------------------------------------------------
-FROM builder AS wolfssl-builder
+# Two alternative source stages are defined below. The FIPS_VARIANT build arg
+# selects which one feeds the wolfssl-builder stage, and is passed directly
+# to ./configure --enable-fips=<variant>.
 
-# Download and extract wolfSSL commercial FIPS source using BuildKit secret.
+# Commercial FIPS v5.2.3 bundle (default). Download and extract wolfSSL
+# commercial FIPS source using BuildKit secret for the bundle password.
 # This bundle name can change depending on wolfCrypt FIPS OE
-RUN --mount=type=secret,id=wolfssl_pw \
+FROM builder AS wolfssl-source-v5.2.3
+RUN --mount=type=secret,id=wolfssl_pw,required=true \
     PW="$(cat /run/secrets/wolfssl_pw)" \
     && curl -fLso /tmp/wolfssl-commercial.7z "https://www.wolfssl.com/comm/wolfssl/wolfssl-5.9.1-commercial-fips-v5.2.3.7z" \
     && echo "13280504dbfea0cb891404ef9ad4f2ee3ab02e0a327c80f93bc1f546224ef8db  /tmp/wolfssl-commercial.7z" | sha256sum -c - \
@@ -70,7 +81,23 @@ RUN --mount=type=secret,id=wolfssl_pw \
     && ls -la /build/ \
     && find /build -maxdepth 1 -type d -name "*wolfssl*" -exec mv {} /build/wolfssl \;
 
-# Build wolfSSL v5.2.3 (cert 4718) with JNI support enabled.
+# wolfSSL "FIPS Ready" bundle (GPLv3). Publicly downloadable, no password
+# required. FIPS Ready contains the wolfCrypt FIPS module code but is NOT a
+# FIPS validated module.
+FROM builder AS wolfssl-source-ready
+RUN curl -fLso /tmp/wolfssl-fips-ready.zip "https://www.wolfssl.com/wolfssl-5.9.1-gplv3-fips-ready.zip" \
+    && echo "c7a12081ead6cd67778e032602451e9efd13716cd0531fe2bc16ca796cd0a0e6  /tmp/wolfssl-fips-ready.zip" | sha256sum -c - \
+    && 7z x /tmp/wolfssl-fips-ready.zip -o/build \
+    && rm -f /tmp/wolfssl-fips-ready.zip \
+    && ls -la /build/ \
+    && find /build -maxdepth 1 -type d -name "*wolfssl*" -exec mv {} /build/wolfssl \;
+
+FROM wolfssl-source-${FIPS_VARIANT} AS wolfssl-builder
+ARG FIPS_VARIANT
+
+# Build wolfSSL with JNI support enabled, in the FIPS mode selected by
+# FIPS_VARIANT (v5.2.3 for the commercial bundle / cert 4718, ready for the
+# FIPS Ready bundle).
 # Running ./fips-hash.sh sets the in-core integrity check hash, after which
 # make needs to be run again to incorporate the updated hash value.
 # We run the wolfCrypt test app to verify native crypto is working after
@@ -78,7 +105,7 @@ RUN --mount=type=secret,id=wolfssl_pw \
 # Disabling MD5 since is not a FIPS validated algorithm in cert 4718.
 WORKDIR /build/wolfssl
 RUN ./configure \
-        --enable-fips=v5 \
+        --enable-fips=${FIPS_VARIANT} \
         --enable-jni \
         --disable-md5 \
         --prefix=/usr/local \
@@ -231,6 +258,15 @@ RUN mkdir -p /build/classes \
 # Stage 6: Runtime Image
 # ------------------------------------------------------------------------------
 FROM rootpublic/openjdk:19-jdk-bookworm-slim
+
+# Record which wolfSSL FIPS bundle variant this image was built from.
+# Images built with FIPS_VARIANT=ready are NOT FIPS validated.
+# WOLFSSL_FIPS_VARIANT is also used by FipsInitCheck at container startup to
+# adjust algorithm availability expectations (e.g. SHA1withECDSA is not
+# available from the newer FIPS module used in FIPS Ready builds).
+ARG FIPS_VARIANT
+LABEL com.wolfssl.fips.variant="${FIPS_VARIANT}"
+ENV WOLFSSL_FIPS_VARIANT=${FIPS_VARIANT}
 
 # No additional runtime dependencies needed
 

@@ -61,6 +61,16 @@ public class FipsInitCheck {
             System.out.println("\nSecurity Manager: " +
                 (sm == null ? "None" : sm.getClass().getName()));
 
+            /* wolfSSL FIPS bundle variant this image was built from,
+             * set as WOLFSSL_FIPS_VARIANT in the Dockerfile runtime stage.
+             * Informational only here; algorithm availability checks below
+             * adjust expectations for FIPS Ready ("ready") builds. */
+            String fipsVariant = System.getenv("WOLFSSL_FIPS_VARIANT");
+            System.out.println("wolfSSL FIPS bundle variant: " +
+                (fipsVariant == null ? "unknown" : fipsVariant) +
+                ("ready".equals(fipsVariant) ?
+                 " (FIPS Ready, NOT FIPS validated)" : ""));
+
             /* List all currently loaded providers, informational */
             listAllRegisteredSecurityProviders();
 
@@ -449,14 +459,17 @@ public class FipsInitCheck {
             "DESede/ECB/NoPadding"
         };
 
-        /* Signature - FIPS and non-FIPS validated algorithms */
+        /* Signature - FIPS and non-FIPS validated algorithms.
+         * SHA1withECDSA is available from the commercial FIPS v5.2.3 module
+         * (cert 4718). Newer wolfCrypt FIPS modules, as used by FIPS Ready
+         * builds, disallow SHA-1 with ECDSA (FIPS 186-5), so wolfJCE does
+         * not register it and it must not be available there. */
         String[] fipsApprovedSignatures = {
             "SHA1withRSA",
             "SHA224withRSA",
             "SHA256withRSA",
             "SHA384withRSA",
             "SHA512withRSA",
-            "SHA1withECDSA",
             "SHA224withECDSA",
             "SHA256withECDSA",
             "SHA384withECDSA",
@@ -476,6 +489,17 @@ public class FipsInitCheck {
             "SHA512withRSA/PSS"
         };
         String[] nonFipsSignatures = {};
+
+        boolean fipsReadyBuild =
+            "ready".equals(System.getenv("WOLFSSL_FIPS_VARIANT"));
+        if (fipsReadyBuild) {
+            nonFipsSignatures = new String[] { "SHA1withECDSA" };
+        } else {
+            fipsApprovedSignatures = Arrays.copyOf(fipsApprovedSignatures,
+                fipsApprovedSignatures.length + 1);
+            fipsApprovedSignatures[fipsApprovedSignatures.length - 1] =
+                "SHA1withECDSA";
+        }
 
         /* SSLContext protocols */
         String[] sslContexts = {
