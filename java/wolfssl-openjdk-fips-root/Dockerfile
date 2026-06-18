@@ -151,10 +151,13 @@ RUN echo "Converting system CA certificates from JKS to WKS format using wolfcry
     && cp cacerts.wks /build/cacerts.wks \
     && echo "Successfully converted system CA certificates to WKS format"
 
-# Copy artifacts
+# Copy artifacts. The filtered Sun provider JAR (FilteredSun, FilteredSunEC,
+# FilteredSunRsaSign) is built by the wolfcrypt-jni 'build-jce-release' target
+# from examples/filtered-providers and placed in lib/filtered-providers/.
 RUN mkdir -p /build/artifacts/lib /build/artifacts/jar /build/artifacts/certs \
     && cp lib/libwolfcryptjni.so /build/artifacts/lib/ \
     && cp lib/wolfcrypt-jni.jar /build/artifacts/jar/wolfcrypt-jni.jar \
+    && cp lib/filtered-providers/filtered-providers.jar /build/artifacts/jar/filtered-providers.jar \
     && cp /build/cacerts.wks /build/artifacts/certs/cacerts.wks
 
 # ------------------------------------------------------------------------------
@@ -218,14 +221,10 @@ COPY --from=wolfjsse-builder /build/artifacts/jar/wolfssl-jsse.jar /usr/share/ja
 
 # Copy and compile Java source files
 COPY src/main/FipsInitCheck.java /build/src/main/
-COPY src/providers/*.java /build/src/providers/
-COPY src/META-INF /build/META-INF
 
-# Compile main application and filtered providers
+# Compile main application
 RUN mkdir -p /build/classes \
-    && javac -cp "/usr/share/java/*" -d /build/classes /build/src/main/FipsInitCheck.java \
-    && javac -cp "/usr/share/java/*" -d /build/classes /build/src/providers/*.java \
-    && jar cvf /build/filtered-providers.jar -C /build/classes com -C /build META-INF
+    && javac -cp "/usr/share/java/*" -d /build/classes /build/src/main/FipsInitCheck.java
 
 # ------------------------------------------------------------------------------
 # Stage 6: Runtime Image
@@ -245,7 +244,7 @@ COPY --from=wolfjsse-builder /build/artifacts/lib/libwolfssljni.so /usr/lib/jni/
 RUN mkdir -p /usr/share/java
 COPY --from=wolfjce-builder /build/artifacts/jar/wolfcrypt-jni.jar /usr/share/java/
 COPY --from=wolfjsse-builder /build/artifacts/jar/wolfssl-jsse.jar /usr/share/java/
-COPY --from=java-compiler /build/filtered-providers.jar /usr/share/java/
+COPY --from=wolfjce-builder /build/artifacts/jar/filtered-providers.jar /usr/share/java/
 
 # Set up environment
 ENV JAVA_HOME=/usr/local/openjdk-19
@@ -317,45 +316,18 @@ ENV FIPS_CHECK=true
 # support even when users set custom classpaths
 ENV CLASSPATH="/usr/share/java/wolfcrypt-jni.jar:/usr/share/java/wolfssl-jsse.jar:/usr/share/java/filtered-providers.jar"
 
-# JVM flags for the filtered providerw which wrap Sun providers for non-crypto
-# services. These flags are required because FilteredSun* providers use
+# JVM flags for the filtered providers which wrap Sun providers for non-crypto
+# services. These flags are required because the FilteredSun* providers use
 # reflection to access internal Sun provider classes and copy some service
 # definitions.
 #
-# --add-modules=jdk.crypto.ec
-#       Required for: Loading the EC crypto module containing SunEC provider
-#       Used by: FilteredSunEC.java - ClassLoader.getPlatformClassLoader()
-#           to load sun.security.ec.SunEC class
+# The filtered providers are maintained in the wolfcrypt-jni repository under
+# examples/filtered-providers. See the per-flag rationale in:
+#     examples/filtered-providers/docs/add-opens.md
 #
-# --add-exports=jdk.crypto.ec/sun.security.ec=ALL-UNNAMED
-#       Required for: Exporting sun.security.ec package classes for access
-#       Used by: FilteredSunEC.java - Class.forName("sun.security.ec.SunEC")
-#           to instantiate the original SunEC provider
-#
-# --add-opens=jdk.crypto.ec/sun.security.ec=ALL-UNNAMED
-#       Required for: Reflection access to SunEC provider internals
-#       Used by: FilteredSunEC.java - originalService.newInstance()
-#           delegation for EC KeyFactory and AlgorithmParameters
-#
-# --add-opens=java.base/java.security=ALL-UNNAMED
-#       Required for: Reflection access to Provider.Service private fields
-#       Used by: All FilteredSun*.java - accessing private fields:
-#           className, aliases, attributes via getDeclaredField()
-#
-# --add-opens=java.base/sun.security.provider=ALL-UNNAMED
-#       Required for: Access to internal Sun provider classes
-#       Used by: FilteredSun.java - Class.forName("sun.security.provider.Sun")
-#           to load and instantiate original SUN provider
-#
-# --add-opens=java.base/sun.security.util=ALL-UNNAMED
-#       Required for: Access to UString class used in service attribute keys
-#       Used by: All FilteredSun*.java - stringField.get(key)
-#           to extract string values from UString attribute keys
-#
-# --add-opens=java.base/sun.security.rsa=ALL-UNNAMED
-#       Required for: Access to internal SunRsaSign provider classes
-#       Used by: FilteredSunRsaSign.java - Class.forName("sun.security.rsa.SunRsaSign")
-#                to load and instantiate original SunRsaSign provider
+# Note: the jdk.crypto.ec flags below are correct for JDK 9-21. On JDK 22+
+# SunEC moved into java.base, and the EC flags must target java.base instead
+# (see add-opens.md). This image currently uses JDK 19.
 ENV JAVA_TOOL_OPTIONS="\
 --add-modules=jdk.crypto.ec \
 --add-exports=jdk.crypto.ec/sun.security.ec=ALL-UNNAMED \
