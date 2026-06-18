@@ -2,7 +2,10 @@
 # Extends the wolfssl-openjdk-fips-root base image to provide basic testing
 # of JCA cryptographic operations and TLS functionality
 
-FROM wolfssl-openjdk-fips-root:latest
+# Base image is configurable so the test image can be built against any tag
+# or variant of the base image (build.sh passes this via -b/--base)
+ARG BASE_IMAGE=wolfssl-openjdk-fips-root:latest
+FROM ${BASE_IMAGE}
 
 LABEL maintainer="wolfSSL Inc. <support@wolfssl.com>"
 LABEL description="FIPS-compliant wolfSSL Java test application demonstrating JCA and TLS usage"

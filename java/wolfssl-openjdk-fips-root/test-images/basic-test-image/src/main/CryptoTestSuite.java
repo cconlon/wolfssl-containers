@@ -554,10 +554,31 @@ public class CryptoTestSuite {
         KeyPair keyPair = keyPairGen.generateKeyPair();
 
         String[] algorithms = {
-            "SHA1withECDSA", "SHA224withECDSA", "SHA256withECDSA",
+            "SHA224withECDSA", "SHA256withECDSA",
             "SHA384withECDSA", "SHA512withECDSA", "SHA3-224withECDSA",
             "SHA3-256withECDSA", "SHA3-384withECDSA", "SHA3-512withECDSA"
         };
+
+        /* SHA1withECDSA is available from the commercial FIPS v5.2.3 module
+         * (cert 4718). Newer wolfCrypt FIPS modules, as used by FIPS Ready
+         * builds, disallow SHA-1 with ECDSA (FIPS 186-5), so wolfJCE does
+         * not register it. The base image records its bundle variant in
+         * the WOLFSSL_FIPS_VARIANT environment variable. */
+        boolean fipsReadyBuild =
+            "ready".equals(System.getenv("WOLFSSL_FIPS_VARIANT"));
+        if (fipsReadyBuild) {
+            try {
+                Signature.getInstance("SHA1withECDSA");
+                throw new SecurityException("SHA1withECDSA should not be " +
+                    "available in FIPS Ready builds");
+            } catch (NoSuchAlgorithmException e) {
+                System.out.println("   SHA1withECDSA: UNAVAILABLE " +
+                    "(correctly not available in FIPS Ready builds)");
+            }
+        } else {
+            algorithms = Arrays.copyOf(algorithms, algorithms.length + 1);
+            algorithms[algorithms.length - 1] = "SHA1withECDSA";
+        }
 
         for (String algorithm : algorithms) {
             Signature signature = Signature.getInstance(algorithm);

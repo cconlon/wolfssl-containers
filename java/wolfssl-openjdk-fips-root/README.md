@@ -156,10 +156,12 @@ repository.
 ### Prerequisites
 
 - Docker installed and running
-- wolfSSL commercial FIPS package password (required for build)
+- wolfSSL commercial FIPS package password (required for default build)
     + Commercial wolfCrypt packages are provided directly via wolfSSL
     + This package has been tested with Certificate #4718 / FIPS 140-3 (v5.2.3)
     + Password must be supplied at image build time to extract .7z
+    + Not required when building with `--fips=ready` (see
+      [FIPS Ready Builds](#fips-ready-builds))
 
 ### Build Options
 
@@ -179,6 +181,10 @@ repositories to pull in the latest JCE/JSSE provider code.
 - `--wolfssl-jni PATH` - Use local wolfssljni directory
 
 **Build Configuration:**
+- `--fips VARIANT` (or `--fips=VARIANT`) - wolfSSL FIPS variant to build,
+  mirroring wolfSSL's `--enable-fips` configure values: `v5.2.3` (commercial
+  FIPS bundle, default) or `ready` (public GPLv3 wolfSSL FIPS Ready bundle,
+  no password required)
 - `--no-cache` - Disable Docker build cache
 - `--cache-from IMAGE` - Use cache from existing image
 - `-v, --verbose` - Enable verbose build output and debug logging
@@ -200,6 +206,42 @@ repositories to pull in the latest JCE/JSSE provider code.
 
 # Using local development directories
 ./build.sh -p your_wolfssl_password --wolfcrypt-jni ../wolfcrypt-jni-dev --wolfssl-jni ../wolfssljni-dev
+
+# Evaluation build using the GPLv3 FIPS Ready bundle (no password)
+./build.sh --fips=ready
+```
+
+### FIPS Ready Builds
+
+By default this container builds against the commercial wolfSSL FIPS bundle,
+which is password-protected and distributed directly by wolfSSL to customers.
+For users who want to evaluate the container without a commercial bundle, the
+`--fips=ready` option builds against the publicly downloadable, GPLv3-licensed
+[wolfSSL FIPS Ready](https://www.wolfssl.com/license/fips/) bundle instead:
+
+```bash
+./build.sh --fips=ready
+```
+
+FIPS Ready builds compile the same wolfCrypt FIPS module code and run it in
+FIPS Ready mode (`./configure --enable-fips=ready`), including the FIPS
+in-core integrity check and power-on self tests. However, **FIPS Ready is NOT
+a FIPS validated module** and must not be used where validated cryptography
+is required. For production/compliance use, build with the commercial FIPS
+bundle (contact fips@wolfssl.com).
+
+Algorithm availability may also differ slightly, since FIPS Ready tracks a
+newer wolfCrypt FIPS module than Certificate #4718. For example,
+`SHA1withECDSA` is not available in FIPS Ready builds (FIPS 186-5 disallows
+SHA-1 with ECDSA). The container startup checks (`FipsInitCheck`) adjust
+their expectations automatically based on the `WOLFSSL_FIPS_VARIANT`
+environment variable baked into the image.
+
+Images record the bundle variant they were built from in the
+`com.wolfssl.fips.variant` label (`v5.2.3` or `ready`):
+
+```bash
+docker inspect --format '{{index .Config.Labels "com.wolfssl.fips.variant"}}' wolfssl-openjdk-fips-root:latest
 ```
 
 ### Run the Container
@@ -229,6 +271,7 @@ docker run -v /path/to/your/app:/app \
 | `JAVA_OPTS` | JVM configuration options | `-Xmx512m` |
 | `JAVA_TOOL_OPTIONS` | JVM module access flags for filtered providers | See Dockerfile |
 | `CLASSPATH` | Application classpath including provider JARs (for ServiceLoader) | `/usr/share/java/*.jar` |
+| `WOLFSSL_FIPS_VARIANT` | wolfSSL FIPS bundle variant the image was built from (set at build time, used by startup FIPS checks) | `v5.2.3` or `ready` |
 | `WOLFJCE_DEBUG` | Enable wolfJCE debug logging | `false` |
 | `WOLFJSSE_DEBUG` | Enable wolfJSSE debug logging | `false` |
 | `WOLFJSSE_ENGINE_DEBUG` | Enable wolfJSSE SSLEngine debug logging | `false` |
@@ -541,11 +584,12 @@ builds of this container use wolfSSL 5.9.1 and are not affected.
 
 ## Version Information
 
-- **wolfSSL**: 5.9.1 Commercial FIPS v5.2.3
+- **wolfSSL**: 5.9.1 Commercial FIPS v5.2.3 (default),
+  or 5.9.1 GPLv3 FIPS Ready (with `--fips=ready`, not FIPS validated)
 - **Base Image**: Root.io OpenJDK 19 (Debian Bookworm Slim)
 - **wolfcrypt-jni**: Master branch (GitHub)
 - **wolfssljni**: Master branch (GitHub)
-- **FIPS Certificate**: #4718
+- **FIPS Certificate**: #4718 (commercial FIPS builds)
 
 ## Documentation
 

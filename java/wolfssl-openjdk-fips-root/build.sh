@@ -7,6 +7,7 @@ set -e
 IMAGE_NAME="wolfssl-openjdk-fips-root"
 IMAGE_TAG="latest"
 WOLFSSL_PASSWORD=""
+FIPS_VARIANT="v5.2.3"
 BUILD_ARGS=""
 export DOCKER_BUILDKIT=1
 : "${BUILDKIT_PROGRESS:=auto}"
@@ -30,7 +31,15 @@ usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
     echo "Options:"
-    echo "  -p, --password PASSWORD   wolfSSL commercial FIPS package password (required)"
+    echo "  -p, --password PASSWORD   wolfSSL commercial FIPS package password"
+    echo "                            (required unless --fips=ready is used)"
+    echo "  --fips VARIANT            wolfSSL FIPS variant to build (--fips=VARIANT also"
+    echo "                            accepted), mirrors wolfSSL's --enable-fips values:"
+    echo "                              v5.2.3 - commercial FIPS bundle (default),"
+    echo "                                       requires -p/--password"
+    echo "                              ready  - public GPLv3 wolfSSL FIPS Ready bundle,"
+    echo "                                       no password required. For evaluation use,"
+    echo "                                       NOT FIPS validated"
     echo "  -n, --name NAME           Docker image name (default: wolfssl-openjdk-fips-root)"
     echo "  -t, --tag TAG             Docker image tag (default: latest)"
     echo "  --no-cache                Disable Docker build cache (cache enabled by default)"
@@ -46,6 +55,7 @@ usage() {
     echo ""
     echo "Examples:"
     echo "  $0 -p your_password                        # Basic build (with cache)"
+    echo "  $0 --fips=ready                            # Evaluation/CI build with GPLv3 FIPS Ready bundle"
     echo "  $0 -p your_password --no-cache             # Build without cache"
     echo "  $0 -p your_password --cache-from myimg     # Use cache from existing image"
     echo "  $0 -p your_password -v                     # Verbose build with wolfSSL debug logging"
@@ -61,6 +71,14 @@ while [[ $# -gt 0 ]]; do
         -p|--password)
             WOLFSSL_PASSWORD="$2"
             shift 2
+            ;;
+        --fips)
+            FIPS_VARIANT="$2"
+            shift 2
+            ;;
+        --fips=*)
+            FIPS_VARIANT="${1#*=}"
+            shift
             ;;
         -n|--name)
             IMAGE_NAME="$2"
@@ -121,11 +139,33 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Validate required arguments
-if [ -z "$WOLFSSL_PASSWORD" ]; then
-    echo -e "${RED}Error: wolfSSL password is required${NC}"
-    echo "Use -p or --password to specify the password"
-    exit 1
+case "$FIPS_VARIANT" in
+    v5.2.3|ready)
+        ;;
+    *)
+        echo -e "${RED}Error: Unsupported FIPS variant '$FIPS_VARIANT'${NC}"
+        echo "Supported values: v5.2.3 (commercial, default), ready (GPLv3 FIPS Ready)"
+        exit 1
+        ;;
+esac
+
+if [ "$FIPS_VARIANT" = "ready" ]; then
+    if [ -n "$WOLFSSL_PASSWORD" ]; then
+        echo -e "${RED}Error: --fips=ready uses the public GPLv3 FIPS Ready bundle and does not take a password${NC}"
+        echo "Remove -p/--password, or use --fips=v5.2.3 to build the commercial FIPS package"
+        exit 1
+    fi
+else
+    if [ -z "$WOLFSSL_PASSWORD" ]; then
+        echo -e "${RED}Error: wolfSSL password is required${NC}"
+        echo "Use -p or --password to specify the password,"
+        echo "or use --fips=ready to build with the public GPLv3 FIPS Ready bundle"
+        exit 1
+    fi
 fi
+
+# Pass selected wolfSSL FIPS bundle variant to Docker build
+BUILD_ARGS="$BUILD_ARGS --build-arg FIPS_VARIANT=$FIPS_VARIANT"
 
 # Validate local directories if specified
 if [ -n "$WOLFCRYPT_JNI_LOCAL" ]; then
@@ -179,6 +219,10 @@ FULL_IMAGE_NAME="${IMAGE_NAME}:${IMAGE_TAG}"
 
 echo -e "${GREEN}Building FIPS-compliant wolfSSL OpenJDK container...${NC}"
 echo -e "${YELLOW}Image name: $FULL_IMAGE_NAME${NC}"
+echo -e "${YELLOW}wolfSSL FIPS bundle: $FIPS_VARIANT${NC}"
+if [ "$FIPS_VARIANT" = "ready" ]; then
+    echo -e "${YELLOW}NOTE: FIPS Ready builds are for evaluation/CI and are NOT FIPS validated${NC}"
+fi
 echo ""
 
 # Prepare build context with local directories if specified
@@ -220,8 +264,10 @@ fi
 echo -e "${GREEN}Starting Docker build...${NC}"
 export DOCKER_BUILDKIT=$DOCKER_BUILDKIT
 
-# Prepare BuildKit secret
-if [[ -n "${WOLFSSL_PASSWORD:-}" ]]; then
+# Prepare BuildKit secret (commercial bundle only, FIPS Ready needs no password)
+if [ "$FIPS_VARIANT" = "ready" ]; then
+    SECRET_FLAG=()
+elif [[ -n "${WOLFSSL_PASSWORD:-}" ]]; then
     export WOLFSSL_PASSWORD
     SECRET_FLAG=( --secret id=wolfssl_pw,env=WOLFSSL_PASSWORD )
 else
@@ -278,6 +324,7 @@ if [ $? -eq 0 ]; then
     echo ""
     echo -e "${GREEN}Build Summary:${NC}"
     echo -e "${GREEN}  Image: $FULL_IMAGE_NAME${NC}"
+    echo -e "${GREEN}  wolfSSL FIPS bundle: $FIPS_VARIANT${NC}"
     echo -e "${GREEN}  Status: Ready for use${NC}"
     echo ""
     echo -e "${YELLOW}To run the container:${NC}"
